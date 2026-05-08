@@ -2,9 +2,8 @@
  * Command handler — processes /slash commands from users.
  * Extracted from daemon.ts for modularity.
  */
-import { existsSync, statSync, realpathSync } from 'node:fs';
-import { resolve, relative, isAbsolute } from 'node:path';
-import { homedir } from 'node:os';
+import { existsSync, statSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { config } from '../config.js';
 import { getBot, getAllBots } from '../bot-registry.js';
 import * as sessionStore from '../services/session-store.js';
@@ -46,82 +45,12 @@ export interface SlashCommandInvocation {
 const MULTILINE_COMMANDS = new Set(['/schedule']);
 
 /**
- * Canonicalize a directory path for boundary checks. Falls back to the
- * pre-realpath form when the path can't be resolved (e.g. permission denied
- * on an intermediate symlink); the validator then errs on the side of treating
- * the literal path.
+ * Validate a user-supplied path for `/cd` and `/oncall bind`. Trust model is
+ * "owner explicitly chose a directory" — the daemon already runs CLI prompts
+ * with full filesystem access, so an allowlist would be theater. We only do
+ * the typo guards: exists and is a directory.
  */
-function canonicalize(p: string): string {
-  try { return realpathSync(p); } catch { return resolve(p); }
-}
-
-/** True iff `target` is exactly `root` or strictly under it (after canonicalizing). */
-function isUnderRoot(target: string, root: string): boolean {
-  const rel = relative(canonicalize(root), target);
-  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
-}
-
-/**
- * Collect the set of directories the daemon is willing to treat as a working
- * directory.
- *
- * Scoping (`opts.larkAppId`/`opts.chatId`): per-bot config is intentionally
- * NOT cross-bot. We only pull config from the current bot (and only the
- * current chat's existing oncall binding) so that an owner in bot-A's group
- * can't quietly hop into a path that bot-B is configured for.
- *
- * Sources:
- *   - daemon user `homedir()`
- *   - global `WORKING_DIR` / `PROJECT_SCAN_DIR` env (`config.daemon.*`)
- *   - the *current* bot's `workingDir` / `workingDirs` / `projectScanDir`
- *   - the *current* chat's existing oncall binding (so a re-bind on the
- *     already-bound dir doesn't get rejected after a daemon restart)
- *   - explicit opt-in via `BOTMUX_EXTRA_ROOTS` (comma-separated)
- */
-export function collectAllowedRoots(opts: { larkAppId?: string; chatId?: string } = {}): string[] {
-  const roots = new Set<string>();
-  const add = (p: string | undefined) => {
-    if (!p) return;
-    roots.add(resolve(expandHome(p)));
-  };
-  add(homedir());
-  add(config.daemon.workingDir);
-  for (const wd of (config.daemon.workingDirs ?? [])) add(wd);
-  add(config.daemon.projectScanDir);
-  if (opts.larkAppId) {
-    let cfg: ReturnType<typeof getBot>['config'] | undefined;
-    try { cfg = getBot(opts.larkAppId).config; } catch { /* unknown bot — skip */ }
-    if (cfg) {
-      add(cfg.workingDir);
-      for (const wd of (cfg.workingDirs ?? [])) add(wd);
-      add(cfg.projectScanDir);
-      // Only the *current* chat's binding, not every chat this bot serves.
-      if (opts.chatId) {
-        const oc = (cfg.oncallChats ?? []).find(c => c.chatId === opts.chatId);
-        if (oc) add(oc.workingDir);
-      }
-    }
-  }
-  const extra = (process.env.BOTMUX_EXTRA_ROOTS ?? '')
-    .split(',').map(s => s.trim()).filter(Boolean);
-  for (const r of extra) add(r);
-  return [...roots];
-}
-
-/**
- * Validate a user-supplied path for `/cd` and `/oncall bind`:
- *   1. exists and is a directory (not a regular file)
- *   2. lives under one of the allowed roots (`path.relative` based — no
- *      `/root2` false-positive that the previous `startsWith(home)` had)
- *
- * On success returns the canonicalized absolute path; on failure returns a
- * user-facing error that names the allowed roots and the `BOTMUX_EXTRA_ROOTS`
- * escape hatch so admins know how to widen the boundary.
- */
-export function validateWorkingDir(
-  input: string,
-  opts: { larkAppId?: string; chatId?: string } = {},
-): { ok: true; resolvedPath: string } | { ok: false; error: string } {
+export function validateWorkingDir(input: string): { ok: true; resolvedPath: string } | { ok: false; error: string } {
   const resolvedPath = resolve(expandHome(input));
   if (!existsSync(resolvedPath)) {
     return { ok: false, error: `目录不存在：${resolvedPath}` };
@@ -133,22 +62,7 @@ export function validateWorkingDir(
   if (!isDir) {
     return { ok: false, error: `路径不是目录：${resolvedPath}` };
   }
-  const canonical = canonicalize(resolvedPath);
-  const allowedRoots = collectAllowedRoots(opts);
-  if (!allowedRoots.some(root => isUnderRoot(canonical, root))) {
-    return {
-      ok: false,
-      error: [
-        `路径不在允许的工作区根目录下：${canonical}`,
-        `当前允许的根：`,
-        ...allowedRoots.map(r => `  - ${r}`),
-        '',
-        '如需扩展，可设置环境变量 BOTMUX_EXTRA_ROOTS（逗号分隔多个目录），',
-        '或在 bot 配置中添加 workingDirs / projectScanDir 后重启 daemon。',
-      ].join('\n'),
-    };
-  }
-  return { ok: true, resolvedPath: canonical };
+  return { ok: true, resolvedPath };
 }
 
 /** Parse a user-authored slash command after leading @mentions have already
@@ -376,7 +290,7 @@ export async function handleCommand(
           await sessionReply(rootId, '当前话题没有活跃的会话。');
           break;
         }
-        const validation = validateWorkingDir(targetPath, { larkAppId, chatId: ds.chatId });
+        const validation = validateWorkingDir(targetPath);
         if (!validation.ok) {
           await sessionReply(rootId, validation.error);
           break;
@@ -647,7 +561,7 @@ export async function handleCommand(
             await sessionReply(rootId, '用法：/oncall bind <path>\n例如：/oncall bind ~/projects/payments-service');
             break;
           }
-          const validation = validateWorkingDir(target, { larkAppId: appId, chatId });
+          const validation = validateWorkingDir(target);
           if (!validation.ok) {
             await sessionReply(rootId, validation.error);
             break;
