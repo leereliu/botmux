@@ -289,17 +289,57 @@ export function buildFollowUpContent(
  */
 export function buildBridgeInputContent(
   content: string,
-  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[] },
+  opts?: {
+    attachments?: LarkAttachment[];
+    mentions?: LarkMention[];
+    selfMention?: { name?: string | null; openId?: string | null };
+  },
 ): string {
-  const parts: string[] = [content];
+  const selfMention = opts?.selfMention;
+  const selfNames = new Set<string>();
+  if (selfMention?.name) selfNames.add(selfMention.name);
+  for (const m of opts?.mentions ?? []) {
+    if (selfMention?.openId && m.openId === selfMention.openId) selfNames.add(m.name);
+    if (selfMention?.name && m.name === selfMention.name) selfNames.add(m.name);
+  }
+
+  const isSelfMention = (m: LarkMention): boolean => {
+    if (selfMention?.openId && m.openId === selfMention.openId) return true;
+    return selfNames.has(m.name);
+  };
+  const stripLeadingSelfMentions = (s: string): string => {
+    if (selfNames.size === 0) return s;
+    let out = s.trimStart();
+    const tags = [...selfNames]
+      .sort((a, b) => b.length - a.length)
+      .map(name => `@${name}`);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const tag of tags) {
+        if (!out.startsWith(tag)) continue;
+        const next = out.charAt(tag.length);
+        // Avoid stripping prefixes like "@CodexFoo" when the bot name is
+        // "Codex"; Lark-rendered mentions are followed by whitespace or EOL.
+        if (next && !/\s/.test(next)) continue;
+        out = out.slice(tag.length).trimStart();
+        changed = true;
+        break;
+      }
+    }
+    return out;
+  };
+
+  const parts: string[] = [stripLeadingSelfMentions(content)];
 
   if (opts?.attachments && opts.attachments.length > 0) {
     const lines = opts.attachments.map(a => `- ${a.name} (${a.path})`);
     parts.push(`\n[附件]\n${lines.join('\n')}`);
   }
 
-  if (opts?.mentions && opts.mentions.length > 0) {
-    const lines = opts.mentions.map(m => `- @${m.name}`);
+  const mentions = opts?.mentions?.filter(m => !isSelfMention(m)) ?? [];
+  if (mentions.length > 0) {
+    const lines = mentions.map(m => `- @${m.name}`);
     parts.push(`\n[@提及]\n${lines.join('\n')}`);
   }
 

@@ -729,10 +729,12 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     // harvest (Claude bridge or Codex bridge) handles the reply path
     // out-of-band.
     const isBridge = !!ds.adoptedFrom;
+    const selfBot = getBot(ds.larkAppId);
     const msgContent = isBridge
       ? buildBridgeInputContent(parsed.content, {
           attachments,
           mentions: parsed.mentions,
+          selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
         })
       : buildFollowUpContent(parsed.content, ds.session.sessionId, {
           attachments,

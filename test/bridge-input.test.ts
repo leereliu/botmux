@@ -34,6 +34,39 @@ describe('buildBridgeInputContent', () => {
     expect(out).toContain('@Codex');
   });
 
+  it('strips leading self mention and omits it from mention prose', () => {
+    const mentions: LarkMention[] = [{ key: '@_1', name: 'Codex', openId: 'ou_self' }];
+    const out = buildBridgeInputContent('@Codex hello', {
+      mentions,
+      selfMention: { name: 'Codex', openId: 'ou_self' },
+    });
+
+    expect(out).toBe('hello');
+  });
+
+  it('keeps non-self mentions while filtering self mentions', () => {
+    const mentions: LarkMention[] = [
+      { key: '@_1', name: 'Codex', openId: 'ou_self' },
+      { key: '@_2', name: 'Claude', openId: 'ou_other' },
+    ];
+    const out = buildBridgeInputContent('@Codex ask Claude', {
+      mentions,
+      selfMention: { name: 'Codex', openId: 'ou_self' },
+    });
+
+    expect(out).toContain('ask Claude');
+    expect(out).not.toContain('@Codex');
+    expect(out).toContain('@Claude');
+  });
+
+  it('does not strip non-mention prefixes that merely start with the bot name', () => {
+    const out = buildBridgeInputContent('@CodexFoo hello', {
+      selfMention: { name: 'Codex', openId: 'ou_self' },
+    });
+
+    expect(out).toBe('@CodexFoo hello');
+  });
+
   it('contrast: buildFollowUpContent (non-bridge) DOES inject botmux_reminder', () => {
     const out = buildFollowUpContent('hi', 'sid-123', { isAdoptMode: false });
     // baseline: confirms the test for buildBridgeInputContent is meaningful
