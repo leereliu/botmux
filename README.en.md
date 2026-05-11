@@ -166,14 +166,7 @@ Once the bot is sending and receiving messages cleanly, run:
 botmux autostart enable
 ```
 
-This registers the daemon with your user's init system (launchd on macOS, user systemd on Linux). **No sudo required.** After a reboot — or after logging back in — the daemon comes up on its own; you never need to remember `botmux start` again.
-
-- The command only manages the "starts at boot" hook — it does **not** touch a running daemon.
-- On a headless Linux box where you log out between sessions, also run `sudo loginctl enable-linger <your-user>` so user systemd survives logout. The command warns you if linger is off.
-- To disable autostart: `botmux autostart disable` (also leaves the daemon alone). Check state: `botmux autostart status`.
-- After switching nvm/fnm Node versions, re-run `botmux autostart enable` to refresh the embedded paths — `botmux start`/`restart` also detect path drift and refresh in place.
-
-See [CLI Commands § Boot-time Autostart](#boot-time-autostart) below for the full reference.
+This registers the daemon with your user's init system (launchd on macOS, user systemd on Linux). **No sudo required.** After a reboot — or after logging back in — the daemon comes up on its own. See [CLI Commands § Boot-time Autostart](#boot-time-autostart) below for the full reference.
 
 ---
 
@@ -199,7 +192,7 @@ On mobile/tablet, a floating shortcut toolbar provides Esc, Ctrl+C, Tab, arrow k
 
 ### Multi-Bot Collaboration
 
-Run multiple Lark bots on a single machine, each mapped to a different CLI. In the same group chat, messages are routed via @mention — each bot gets its own isolated CLI process. With a single bot in the group, it responds automatically without @.
+Run multiple Lark bots on a single machine, each mapped to a different CLI. In the same group chat, messages are routed via @mention — each bot gets its own isolated CLI process. With a single bot in the group, it responds automatically without @. In a regular (non-topic) group, `@<bot1> @<bot2> /t xxx` spawns one independent thread per mentioned bot anchored at the same message.
 
 ### Tmux Persistence
 
@@ -208,8 +201,8 @@ When tmux is installed, botmux automatically uses it. CLI processes persist insi
 **Key benefit: daemon restarts don't interrupt the CLI.** During `botmux restart`, the worker process exits but the tmux session (and the CLI inside it) keeps running. The next incoming message triggers a re-attach — no `--resume` context reload needed.
 
 ```bash
-# Recommended: interactive session picker — select and attach to tmux
-npx botmux list
+# Interactive session picker — select and attach to tmux (see § CLI Commands)
+botmux list
 
 # Or manually attach (session name = bmx-<first 8 chars of session ID>)
 tmux attach -t bmx-<first-8-chars-of-session-id>
@@ -218,10 +211,6 @@ tmux attach -t bmx-<first-8-chars-of-session-id>
 # Force pure pty mode (disable tmux)
 BACKEND_TYPE=pty botmux start
 ```
-
-`botmux list` provides an interactive TUI showing all active sessions with ID, title, working directory, PID, uptime, and status. Use arrow keys to select and Enter to attach. Use `botmux list --plain` for plain-text table output suitable for scripting.
-
-**Session naming:** `bmx-<first 8 chars of session UUID>`
 
 **Lifecycle:**
 
@@ -291,8 +280,8 @@ OpenCode), with no MCP protocol support required.
 
 ### Workflow
 
-1. Send a message in your Lark topic group to create a new thread
-2. The bot shows a repo selection card — pick a project or click "Start directly"
+1. Send a message in a Lark topic group to create a new thread; or in a regular group send `/t <prompt>` to force-open a new topic
+2. The bot shows a repo selection card — pick a project or click "Start directly" (chats bound via `/oncall bind` skip this step)
 3. The CLI spawns in the selected directory
 4. A live streaming card appears in the thread, showing real-time terminal output with markdown rendering
 5. Each reply creates a new streaming card for that turn; previous cards freeze at their last state
@@ -309,20 +298,21 @@ OpenCode), with no MCP protocol support required.
 | `/cd <path>` | Change working directory |
 | `/status` | Show session info (uptime, terminal URL, etc.) |
 | `/restart` | Restart CLI process |
-| `/close` | Close session and terminate CLI |
+| `/close` | Close session and send a resumable card (with the CLI's native resume command) |
+| `/t <prompt>` / `/topic <prompt>` | Force-open a new topic from a non-topic group (shows the repo selector); empty prompt is allowed — fill it in after picking the repo |
+| `/oncall bind <path>` | Bind current chat to a project dir, skip the repo card (any group member can @ the bot; buttons / daemon commands still gated by `allowedUsers`) |
+| `/oncall unbind` / `/oncall status` | Unbind / inspect oncall binding |
 | `/adopt` | Adopt a running CLI session (tmux) |
 | `/schedule` | Manage scheduled tasks |
+| `/login` / `/login status` | Lark user OAuth (e.g. to download images from third-party cards) / show OAuth status |
 | `/help` | Show available commands |
 | `/compact` `/model` `/clear` `/plugin` `/usage` | Forwarded verbatim to the underlying CLI (e.g. Claude Code's built-in slash commands) |
 
 ### Scheduled Task Management
 
-**Recommended: talk to the agent**
-Just say "add a reminder to summarize yesterday's PRs every morning at 9:00" — the `botmux-schedule` Skill handles it and confirms with you.
+Two creation paths are covered above in [Scheduled Tasks](#scheduled-tasks); below is just the slash-command syntax and management commands.
 
-**Slash command (quick)**
-
-```
+```bash
 # Chinese NL
 /schedule 每日17:50 check AI news
 /schedule 工作日每天9:00 run health check
@@ -332,22 +322,14 @@ Just say "add a reminder to summarize yesterday's PRs every morning at 9:00" —
 /schedule 30分钟后 verify deployment
 /schedule 明天9:00 standup reminder
 
-# English
+# English / cron
 /schedule every 2h probe services
 /schedule 30m remind me to drink water
-
-# Cron
 /schedule 0 9 * * * good morning
-```
 
-Manage tasks:
-
-```
+# Manage
 /schedule list
-/schedule remove <id>
-/schedule enable <id>
-/schedule disable <id>
-/schedule run <id>
+/schedule remove|enable|disable|run <id>
 ```
 
 **Execution behavior**: the task fires inside the **original thread where it was created** — no new topic per run. Working directory is preserved. If the original session is still alive, the prompt is injected into it; otherwise a fresh worker spawns bound to the same thread root.
@@ -393,6 +375,7 @@ botmux setup
 | `workingDir` | No | Default working directory, supports comma-separated |
 | `allowedUsers` | No | Allowed users (email prefixes or open_ids) |
 | `projectScanDir` | No | Directory to scan for git repos |
+| `oncallChats` | No | Oncall bindings (written by `/oncall bind`), e.g. `[{ "chatId": "oc_xxx", "workingDir": "~/projects/foo" }]`; any group member can @ the bot |
 
 **Config priority:** `BOTS_CONFIG` env var > `~/.botmux/bots.json`
 
