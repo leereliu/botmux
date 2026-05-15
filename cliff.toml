@@ -32,6 +32,10 @@ split_commits = false
 filter_commits = false
 tag_pattern = "v[0-9].*"
 sort_commits = "oldest"
+# 跳过仓库维护者自己直接 push 的 commit (PR 合并仍保留,PR commit 的 author 是 PR 作者)
+commit_parsers = [
+    { field = "author.email", pattern = "shenhan\\.sh@bytedance\\.com", skip = true },
+]
 
 [remote.github]
 owner = "deepcoldy"
