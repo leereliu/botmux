@@ -8,7 +8,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 import { config } from './config.js';
 import { statSync } from 'node:fs';
-import { getChatMode, replyMessage, resolveAllowedUsers, sendMessage } from './im/lark/client.js';
+import { getChatMode, replyMessage, resolveAllowedUsersWithMap, sendMessage } from './im/lark/client.js';
 import { loadBotConfigs, registerBot, getBot, getAllBots, findOncallChatForAnyBot, type BotState, type OncallChat } from './bot-registry.js';
 import * as sessionStore from './services/session-store.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
@@ -1138,7 +1138,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       const hasEmails = bot.resolvedAllowedUsers.some(u => u.includes('@'));
       if (hasEmails) {
         try {
-          bot.resolvedAllowedUsers = await resolveAllowedUsers(cfg.larkAppId, bot.resolvedAllowedUsers);
+          // 同时拿到 raw→open_id 映射，供 /revoke 反查删除 email 形式的 raw 条目（R2#2）。
+          const { resolved, map } = await resolveAllowedUsersWithMap(cfg.larkAppId, bot.resolvedAllowedUsers);
+          bot.resolvedAllowedUsers = resolved;
+          bot.rawAllowedUserResolution = map;
           logger.info(`[${cfg.larkAppId}] Resolved allowedUsers: ${bot.resolvedAllowedUsers.join(', ')}`);
         } catch (err: any) {
           logger.warn(`[${cfg.larkAppId}] Failed to resolve allowedUsers: ${err.message}`);

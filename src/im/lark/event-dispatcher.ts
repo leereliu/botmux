@@ -6,7 +6,7 @@
 import * as Lark from '@larksuiteoapi/node-sdk';
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { getBot, getAllBots, isChatOncallBoundForAnyBot, type BotState } from '../../bot-registry.js';
+import { getBot, getAllBots, isChatOncallBoundForAnyBot, getOwnerOpenId, type BotState } from '../../bot-registry.js';
 import { config } from '../../config.js';
 import { getChatInfo, getChatMode, listChatBotMembers, replyMessage, sendUserMessage } from './client.js';
 import { logger } from '../../utils/logger.js';
@@ -14,6 +14,10 @@ import { parseForceTopicInvocation } from '../../core/command-handler.js';
 import { stripLeadingMentions } from './message-parser.js';
 import { recordObservedBots } from '../../services/observed-bots-store.js';
 import { BOTMUX_REQUIRED_SCOPES, buildScopeDeepLink } from '../../setup/verify-permissions.js';
+import { tryHandleGrantCommand } from './grant-command.js';
+import { buildGrantCard } from './card-builder.js';
+import { openPending, isThrottled } from './grant-pending.js';
+import { localeForBot } from '../../i18n/index.js';
 
 // ─── Bot identity ─────────────────────────────────────────────────────────
 
@@ -503,6 +507,27 @@ export function canOperate(larkAppId: string, _chatId: string | undefined, sende
   return !!senderOpenId && allowedUsers.includes(senderOpenId);
 }
 
+/**
+ * 入口 A：无权限者 @bot 时弹授权申请卡（正文 @owner，由 owner 处置）。
+ * 受 grant-pending 节流：pending 中 / deny 冷却期内静默不发。开放模式（无 owner）兜底不发。
+ */
+async function maybeSendGrantRequestCard(
+  larkAppId: string, message: any, chatId: string, requesterOpenId: string | undefined,
+): Promise<void> {
+  const owner = getOwnerOpenId(larkAppId);
+  if (!owner || !requesterOpenId) return;
+  if (isThrottled(larkAppId, chatId, requesterOpenId)) return;
+  const name = (message?.mentions ?? []).find((m: any) => m?.id?.open_id === requesterOpenId)?.name
+    ?? requesterOpenId;
+  const nonce = openPending(larkAppId, chatId, requesterOpenId);
+  const card = buildGrantCard(
+    { ownerOpenId: owner, requesterOpenId, requesterName: String(name), chatId, nonce, mode: 'request' },
+    localeForBot(larkAppId),
+  );
+  await replyMessage(larkAppId, message.message_id, card, 'interactive')
+    .catch(err => logger.debug(`grant request card send failed: ${err}`));
+}
+
 // ─── Group message access check ──────────────────────────────────────────
 
 /**
@@ -799,6 +824,12 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           return;
         }
 
+        // /grant、/revoke — 群内授权元命令。在路由/spawn 之前拦截（仅 owner，需明确 @ 本 bot），
+        // 否则会被当成 prompt 喂给 CLI 会话。
+        if (await tryHandleGrantCommand(larkAppId, message, senderOpenId)) {
+          return;
+        }
+
         logger.debug('Received message:', message);
 
         // Diagnostic: record the Lark quote-bubble UI quirk where root_id
@@ -898,11 +929,10 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           if (!relax) {
             const access = await checkGroupMessageAccess(larkAppId, message, chatId, senderOpenId);
             if (access === 'not_allowed') {
-              if (!ownsSession) {
-                replyMessage(larkAppId, messageId, JSON.stringify({ text: '⚠️ 无操作权限' }))
-                  .catch(err => logger.debug(`Failed to send permission denied: ${err}`));
-              }
-              logger.debug(`Ignoring group message from non-allowed user: ${senderOpenId}`);
+              // 入口 A：无权限者 @bot → 弹授权申请卡（@owner），代替「无操作权限」。
+              // 覆盖 ownsSession 真假两种情况，但绝不把该消息喂进已有 session。
+              await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId);
+              logger.debug(`Ignoring group message from non-allowed user: ${senderOpenId} (grant request card path)`);
               return;
             }
             if (access === 'ignore') {

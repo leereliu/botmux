@@ -165,6 +165,9 @@ export const messages: Record<string, string> = {
   'help.oncall_bind': '/oncall bind <path>  - Bind this group to a project, skipping the repo-selection card',
   'help.oncall_unbind': '/oncall unbind       - Unbind this group',
   'help.oncall_status': '/oncall status       - Show oncall binding for this group',
+  'help.heading_grant': '🔑 Access grants (owner only):',
+  'help.grant': '/grant @someone   - Pop an authorization card to grant "this chat" or "global" access',
+  'help.revoke': '/revoke @someone  - Revoke their this-chat + global access',
   'help.help': '/help       - Show this help',
 
   // ─── AI system prompt (Claude Code: --append-system-prompt) ──────────────

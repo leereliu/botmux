@@ -168,6 +168,9 @@ export const messages: Record<string, string> = {
   'help.oncall_bind': '/oncall bind <path>  - 把当前群绑到某个项目，跳过仓库选择卡片',
   'help.oncall_unbind': '/oncall unbind       - 解绑当前群',
   'help.oncall_status': '/oncall status       - 查看当前群的 oncall 绑定',
+  'help.heading_grant': '🔑 使用授权（owner 专用）：',
+  'help.grant': '/grant @某人   - 弹授权卡片，授权对方「本群使用」或「全局」',
+  'help.revoke': '/revoke @某人  - 撤销对方的本群 + 全局授权',
   'help.help': '/help       - 显示此帮助',
 
   // ─── AI system prompt (Claude Code: --append-system-prompt) ──────────────
