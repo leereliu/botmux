@@ -18,12 +18,13 @@
  */
 import { execSync, spawnSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, appendFileSync, statSync, unlinkSync } from 'node:fs';
-import { join, dirname, resolve } from 'node:path';
+import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 import { createRequire } from 'node:module';
 import { createHmac, randomBytes } from 'node:crypto';
+import { validateWorkingDir } from './core/working-dir.js';
 import { enableAutostart, disableAutostart, autostartStatus, refreshAutostart } from './autostart.js';
 import { tmuxEnv } from './setup/ensure-tmux.js';
 import { writeBotsJsonAtomic as writeBotsAtomic } from './setup/bots-store.js';
@@ -2801,26 +2802,15 @@ botmux create-group — 用一组机器人新建飞书群
       console.error('--working-dir 不能为空。');
       process.exit(1);
     }
-    const expanded = trimmed.startsWith('~/') ? join(homedir(), trimmed.slice(2)) : trimmed;
-    const resolvedPath = resolve(expanded);
-    if (!existsSync(resolvedPath)) {
-      console.error(`--working-dir 路径不存在: ${resolvedPath}`);
-      process.exit(1);
-    }
-    let isDir = false;
-    try { isDir = statSync(resolvedPath).isDirectory(); }
-    catch (err: any) {
-      console.error(`--working-dir 无法读取: ${resolvedPath} (${err?.message ?? err})`);
-      process.exit(1);
-    }
-    if (!isDir) {
-      console.error(`--working-dir 不是目录: ${resolvedPath}`);
+    const validation = validateWorkingDir(trimmed);
+    if (!validation.ok) {
+      console.error(`--working-dir ${validation.error}`);
       process.exit(1);
     }
     // Keep the user's spelling in bots.json, matching `/oncall bind`, while
     // still showing the resolved path in CLI output for typo diagnostics.
     bindWorkingDir = trimmed;
-    bindWorkingDirResolved = resolvedPath;
+    bindWorkingDirResolved = validation.resolvedPath;
   }
 
   if (botRefs.length === 0) {
