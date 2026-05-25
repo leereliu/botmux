@@ -189,8 +189,11 @@ export async function getChatShareLink(
   chatId: string,
   validityPeriod: 'week' | 'year' | 'permanently' = 'permanently',
 ): Promise<{ ok: true; shareLink: string } | { ok: false; error: string }> {
-  const client = getBotClient(larkAppId);
   try {
+    // getBotClient stays inside the try: this fetch is best-effort and must
+    // never turn a successful group creation into a hard failure, so even a
+    // bad/unconfigured larkAppId resolves to {ok:false}, not a thrown error.
+    const client = getBotClient(larkAppId);
     const res: any = await (client as any).im.v1.chat.link({
       path: { chat_id: chatId },
       data: { validity_period: validityPeriod },
