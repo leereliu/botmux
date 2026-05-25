@@ -19,6 +19,7 @@ import { buildTeamRoster } from '../services/team-roster.js';
 import { getTeam, removeMember, isMember, listTeams, listTeamsForMember, createTeam, addMember, deleteTeam } from '../services/team-store.js';
 import { loadBotConfigs } from '../bot-registry.js';
 import { createInvite, consumeInvite, deleteInvitesForTeam } from '../services/invite-store.js';
+import { removeTeamFederation } from '../services/federation-store.js';
 import { setBotCapability, clearBotCapability } from '../services/bot-profile-store.js';
 import { setBotOwner, clearBotOwner } from '../services/bot-owner-store.js';
 import { listConnectors } from '../services/connector-store.js';
@@ -219,6 +220,7 @@ export async function handleTeamRoute(
     const removed = deleteTeam(dataDir, session.teamId);
     if (!removed) { jsonRes(res, 404, { ok: false, error: 'team_not_found' }); return true; }
     deleteInvitesForTeam(dataDir, session.teamId); // "members + invites dropped" — kill stale codes
+    removeTeamFederation(dataDir, session.teamId); // drop any federated deployments under this team
     const remaining = listTeamsForMember(dataDir, identity);
     const next = remaining[0]?.id ?? '';
     updateSessionTeam(dataDir, sessionToken, next);

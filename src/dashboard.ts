@@ -20,6 +20,8 @@ import { handleDashboardTriggerApi } from './dashboard/trigger-api.js';
 import { handleConnectorApi } from './dashboard/connector-api.js';
 import { handleWebhookRoute } from './dashboard/webhook-routes.js';
 import { handleTeamRoute } from './dashboard/team-routes.js';
+import { handleFederationApi } from './dashboard/federation-api.js';
+import { handleFederationSpokeApi, syncAllMemberships } from './dashboard/federation-spoke-api.js';
 import { getRunsDir } from './workflows/runs-dir.js';
 import { BotOnboardingManager } from './dashboard/bot-onboarding.js';
 import type { ConnectorDefinition } from './services/connector-store.js';
@@ -327,6 +329,12 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // Federation HUB endpoints — cross-deployment, self-authed by invite code /
+    // syncToken, so mounted before the token gate (like webhook/team routes).
+    if (await handleFederationApi(req, res, url, {})) {
+      return;
+    }
+
     // CLI rotate (HMAC + loopback only) — for `botmux dashboard`
     if (req.method === 'POST' && url.pathname === '/__cli/rotate') {
       const ts = req.headers['x-botmux-cli-ts'];
@@ -392,6 +400,11 @@ const server = createServer(async (req, res) => {
     }
 
     if (await handleConnectorApi(req, res, url)) {
+      return;
+    }
+
+    // Federation SPOKE endpoints (owner actions) — token-gated above.
+    if (await handleFederationSpokeApi(req, res, url, {})) {
       return;
     }
 
@@ -860,6 +873,13 @@ const server = createServer(async (req, res) => {
 server.listen(config.dashboard.port, config.dashboard.host, () => {
   logger.info(`[dashboard] listening on ${config.dashboard.host}:${config.dashboard.port}`);
 });
+
+// Federation: periodically push this deployment's bots + heartbeat to every hub
+// it has joined (best-effort; no-op when not federated). Keeps remote rosters fresh.
+const federationSync = setInterval(() => {
+  syncAllMemberships(config.session.dataDir).catch(() => { /* best-effort */ });
+}, 2 * 60 * 1000);
+federationSync.unref();
 
 // Graceful shutdown
 function shutdown(): void {

@@ -1,0 +1,118 @@
+/**
+ * Federation spoke endpoints (join-remote / remote-roster / leave-remote) with a
+ * mock fetcher standing in for the hub.
+ * Run: pnpm vitest run test/federation-spoke-api.test.ts
+ */
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+
+const state = vi.hoisted(() => ({ dataDir: '' }));
+vi.mock('../src/config.js', () => ({ config: { session: { get dataDir() { return state.dataDir; } } } }));
+
+import { handleFederationSpokeApi } from '../src/dashboard/federation-spoke-api.js';
+import { listMemberships } from '../src/services/federation-membership-store.js';
+
+let dataDir: string;
+beforeEach(() => { dataDir = mkdtempSync(join(tmpdir(), 'botmux-spoke-')); state.dataDir = dataDir; });
+
+function writeBots(entries: any[]) { writeFileSync(join(dataDir, 'bots-info.json'), JSON.stringify(entries)); }
+function makeReq(method: string, path: string, body?: unknown): any {
+  const req: any = { method, url: path, headers: {} };
+  req[Symbol.asyncIterator] = async function* () { if (body !== undefined) yield Buffer.from(JSON.stringify(body)); };
+  return req;
+}
+function makeRes(): any {
+  const res: any = { statusCode: 0, _headers: {}, _body: '' };
+  res.setHeader = (k: string, v: any) => { res._headers[k.toLowerCase()] = v; };
+  res.writeHead = (s: number, h?: any) => { res.statusCode = s; if (h) Object.assign(res._headers, h); };
+  res.end = (b?: string) => { res._body = b ?? ''; };
+  return res;
+}
+const json = (res: any) => JSON.parse(res._body);
+const jsonResp = (status: number, body: any) => ({ ok: status >= 200 && status < 300, status, json: async () => body } as any);
+
+describe('handleFederationSpokeApi', () => {
+  it('join-remote: posts local bots to the hub and stores the membership', async () => {
+    writeBots([{ larkAppId: 'cli_me1', botOpenId: null, botName: '我的Bot', cliId: 'claude' }]);
+    let captured: any = null;
+    const fetcher = vi.fn(async (u: any, init: any) => {
+      captured = { url: String(u), body: JSON.parse(init.body) };
+      return jsonResp(200, { ok: true, teamId: 'default', teamName: '研发团队', syncToken: 'TOK123' });
+    });
+    const res = makeRes();
+    const handled = await handleFederationSpokeApi(
+      makeReq('POST', '/api/team/join-remote', { hubUrl: 'http://hub:7891/', inviteCode: 'INV' }),
+      res, new URL('http://x/api/team/join-remote'), { dataDir, fetcher: fetcher as any },
+    );
+    expect(handled).toBe(true);
+    expect(res.statusCode).toBe(200);
+    // called the hub join endpoint with our deployment + bots
+    expect(captured.url).toBe('http://hub:7891/api/federation/join'); // trailing slash normalized
+    expect(captured.body.inviteCode).toBe('INV');
+    expect(captured.body.deployment.bots.map((b: any) => b.larkAppId)).toEqual(['cli_me1']);
+    expect(captured.body.deployment.deploymentId).toMatch(/^dep_/);
+    // membership stored
+    const ms = listMemberships(dataDir);
+    expect(ms.length).toBe(1);
+    expect(ms[0]).toMatchObject({ hubUrl: 'http://hub:7891', teamId: 'default', teamName: '研发团队', syncToken: 'TOK123' });
+  });
+
+  it('join-remote: surfaces hub rejection (403 invite) without storing membership', async () => {
+    writeBots([]);
+    const fetcher = vi.fn(async () => jsonResp(403, { ok: false, error: 'invite_used' }));
+    const res = makeRes();
+    await handleFederationSpokeApi(
+      makeReq('POST', '/api/team/join-remote', { hubUrl: 'http://hub:7891', inviteCode: 'INV' }),
+      res, new URL('http://x/api/team/join-remote'), { dataDir, fetcher: fetcher as any },
+    );
+    expect(res.statusCode).toBe(403);
+    expect(json(res).error).toBe('invite_used');
+    expect(listMemberships(dataDir).length).toBe(0);
+  });
+
+  it('join-remote: hub unreachable → 502 hub_unreachable', async () => {
+    writeBots([]);
+    const fetcher = vi.fn(async () => { throw new Error('ECONNREFUSED'); });
+    const res = makeRes();
+    await handleFederationSpokeApi(
+      makeReq('POST', '/api/team/join-remote', { hubUrl: 'http://hub:7891', inviteCode: 'INV' }),
+      res, new URL('http://x/api/team/join-remote'), { dataDir, fetcher: fetcher as any },
+    );
+    expect(res.statusCode).toBe(502);
+    expect(json(res).error).toBe('hub_unreachable');
+  });
+
+  it('join-remote: rejects bad hub url and missing code', async () => {
+    let res = makeRes();
+    await handleFederationSpokeApi(makeReq('POST', '/api/team/join-remote', { hubUrl: 'ftp://x', inviteCode: 'a' }), res, new URL('http://x/api/team/join-remote'), { dataDir, fetcher: (async () => jsonResp(200, {})) as any });
+    expect(json(res).error).toBe('bad_hub_url');
+    res = makeRes();
+    await handleFederationSpokeApi(makeReq('POST', '/api/team/join-remote', { hubUrl: 'http://h:1' }), res, new URL('http://x/api/team/join-remote'), { dataDir, fetcher: (async () => jsonResp(200, {})) as any });
+    expect(json(res).error).toBe('code_required');
+  });
+
+  it('remote-roster: aggregates each joined hub\'s roster; leave-remote forgets it', async () => {
+    writeBots([]);
+    // join one hub
+    const joinFetcher = vi.fn(async () => jsonResp(200, { ok: true, teamId: 'default', teamName: 'T', syncToken: 'TOK' }));
+    await handleFederationSpokeApi(makeReq('POST', '/api/team/join-remote', { hubUrl: 'http://hub:7891', inviteCode: 'INV' }), makeRes(), new URL('http://x/api/team/join-remote'), { dataDir, fetcher: joinFetcher as any });
+
+    // remote-roster pulls the hub roster
+    const rosterFetcher = vi.fn(async (u: any) => {
+      expect(String(u)).toContain('/api/federation/roster?syncToken=TOK');
+      return jsonResp(200, { ok: true, team: { id: 'default', name: 'T', memberCount: 1 }, deployments: [], bots: [{ larkAppId: 'cli_x', name: 'X' }] });
+    });
+    let res = makeRes();
+    await handleFederationSpokeApi(makeReq('GET', '/api/team/remote-roster'), res, new URL('http://x/api/team/remote-roster'), { dataDir, fetcher: rosterFetcher as any });
+    expect(res.statusCode).toBe(200);
+    expect(json(res).memberships[0].roster.bots[0].larkAppId).toBe('cli_x');
+
+    // leave-remote forgets it
+    res = makeRes();
+    await handleFederationSpokeApi(makeReq('POST', '/api/team/leave-remote', { hubUrl: 'http://hub:7891', teamId: 'default' }), res, new URL('http://x/api/team/leave-remote'), { dataDir });
+    expect(res.statusCode).toBe(200);
+    expect(listMemberships(dataDir).length).toBe(0);
+  });
+});
