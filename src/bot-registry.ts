@@ -84,6 +84,21 @@ export interface BotConfig {
    * routing or permissions.
    */
   brandLabel?: string;
+  /**
+   * When true, suppress the live streaming session card entirely. The web
+   * terminal still runs and the final answer still arrives via `botmux send`;
+   * only the auto-updating status card is never posted/patched. Default
+   * (undefined) keeps the streaming card. For users who find the live card noisy.
+   */
+  disableStreamingCard?: boolean;
+  /**
+   * When true, the streaming card embeds a directly-usable WRITABLE terminal
+   * link in its body (token included → anyone who can see the card can drive
+   * the terminal). Default (undefined) keeps the write link behind the
+   * "get write link" button, which DMs it privately to the clicker. Moot when
+   * {@link disableStreamingCard} is on (no card to embed it in).
+   */
+  writableTerminalLinkInCard?: boolean;
 }
 
 export interface BotState {
@@ -424,6 +439,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // Preserve '' distinctly from undefined: '' means "brand off", undefined
       // means "use default botmux brand". Don't trim-to-undefined here.
       brandLabel: typeof entry.brandLabel === 'string' ? entry.brandLabel : undefined,
+      disableStreamingCard: entry.disableStreamingCard === true || undefined,
+      writableTerminalLinkInCard: entry.writableTerminalLinkInCard === true || undefined,
     });
   }
 

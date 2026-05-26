@@ -7,6 +7,7 @@ export const messages: Record<string, string> = {
   'card.btn.open_terminal': '🖥️ 打开终端',
   'card.btn.open_writable_terminal': '🖥️ 打开可操作终端',
   'card.btn.get_write_link': '🔑 获取操作链接',
+  'card.writable_terminal_link': '🔑 可操作终端（群内可见，任何人可直接操控）：[{url}]({url})',
   'card.btn.restart_cli': '🔄 重启 {cliName}',
   'card.btn.disconnect': '⏏ 断开',
   'card.btn.close_session': '❌ 关闭会话',
@@ -99,6 +100,7 @@ export const messages: Record<string, string> = {
 
   // ─── Command responses ───────────────────────────────────────────────────
   'cmd.no_active_session': '当前话题没有活跃的会话。',
+  'cmd.card.not_ready': '终端尚未就绪，等会话起好后流式卡片会自动出现。',
   'cmd.restart.in_progress': '🔄 正在重启 {cliName}...',
   'cmd.restart.terminated': '{cliName} 进程已终止，下次发消息时将自动恢复。',
   'cmd.cd.usage': '用法：/cd <path>\n例如：/cd ~/projects/my-app',
@@ -179,6 +181,7 @@ export const messages: Record<string, string> = {
   'help.repo_n': '/repo <N>   - 切换到第 N 个项目',
   'help.repo_path': '/repo <路径|项目名> - 直接指定路径或 workingDir 下的项目名，跳过选择卡片',
   'help.status': '/status     - 查看当前会话状态（含终端链接）',
+  'help.card': '/card       - 手动弹出当前会话的流式卡片（关流式时也能临时召唤，并恢复实时刷新）',
   'help.heading_passthrough': '🔀 透传给 {cliName}（字面送达，供其内置 slash 命令处理）：',
   'help.heading_schedule': '⏰ 定时任务：',
   'help.schedule_create': '/schedule 每日17:50 帮我看AI新闻   - 创建定时任务（自然语言）',

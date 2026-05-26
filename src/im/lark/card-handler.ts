@@ -21,7 +21,7 @@ import { createCliAdapterSync } from '../../adapters/cli/registry.js';
 import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
-import { forkWorker, killWorker, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, CARD_POSTING_SENTINEL } from '../../core/worker-pool.js';
+import { forkWorker, killWorker, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, CARD_POSTING_SENTINEL } from '../../core/worker-pool.js';
 import { getSessionWorkingDir, buildNewTopicPrompt, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput } from '../../core/session-manager.js';
 import type { DaemonToWorker, DisplayMode, TermActionKey } from '../../types.js';
 import { sessionKey, sessionAnchorId, frozenDisplayMode } from '../../core/types.js';
@@ -415,6 +415,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           !!ds.adoptedFrom,
           false,
           locDs,
+          undefined,
+          writableTerminalLinkFor(ds),
         );
         scheduleCardPatch(ds, cardJson);
       }
@@ -602,6 +604,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
               false,
               localeForBot(ds.larkAppId),
               cardUsageLimit(ds),
+              writableTerminalLinkFor(ds),
             );
             updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
               logger.debug(`[${tag(ds)}] Failed to migrate unknown frozen card: ${err}`),
@@ -643,6 +646,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           false,
           localeForBot(ds.larkAppId),
           cardUsageLimit(ds),
+          writableTerminalLinkFor(ds),
         );
         updateMessage(ds.larkAppId, frozen.messageId, cardJson).catch(err =>
           logger.debug(`[${tag(ds)}] Failed to migrate frozen card: ${err}`),
@@ -682,6 +686,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           false,
           localeForBot(ds.larkAppId),
           cardUsageLimit(ds),
+          writableTerminalLinkFor(ds),
         );
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
@@ -746,6 +751,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           false,
           localeForBot(ds.larkAppId),
           cardUsageLimit(ds),
+          writableTerminalLinkFor(ds),
         );
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
@@ -785,6 +791,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           false,
           localeForBot(ds.larkAppId),
           cardUsageLimit(ds),
+          writableTerminalLinkFor(ds),
         );
         try { return JSON.parse(cardJson); } catch { /* fall through */ }
       }

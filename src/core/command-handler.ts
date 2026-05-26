@@ -14,7 +14,7 @@ import { buildRepoSelectCard, buildAdoptSelectCard, buildSessionClosedCard, getC
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { deleteMessage, sendMessage, listChatBotMembers } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { killWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion } from './worker-pool.js';
+import { killWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion, postFreshStreamingCard } from './worker-pool.js';
 import { expandHome, getSessionWorkingDir, getProjectScanDir, getProjectScanDirs, rememberLastCliInput } from './session-manager.js';
 import { validateWorkingDir } from './working-dir.js';
 import { discoverAdoptableSessions, validateAdoptTarget, type AdoptableSession } from './session-discovery.js';
@@ -29,7 +29,7 @@ import { t, localeForBot, type Locale } from '../i18n/index.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
-export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help', '/cd', '/repo', '/skip', '/schedule', '/role', '/login', '/adopt', '/oncall', '/group', '/g']);
+export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help', '/cd', '/repo', '/skip', '/schedule', '/role', '/login', '/adopt', '/oncall', '/group', '/g', '/card']);
 
 /**
  * Slash commands that are forwarded verbatim to the underlying CLI (e.g.
@@ -1039,6 +1039,23 @@ export async function handleCommand(
         break;
       }
 
+      case '/card': {
+        if (!ds) {
+          await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
+          break;
+        }
+        // Manual summon. Force the live card on for the rest of this session —
+        // even when the bot has `disableStreamingCard` set — then post a fresh
+        // card. If the worker terminal isn't up yet, the force flag still sticks
+        // so the card appears (and live-updates) as soon as the worker is ready.
+        ds.streamingCardForced = true;
+        const posted = await postFreshStreamingCard(ds, deps.sessionReply);
+        if (!posted) {
+          await sessionReply(rootId, t('cmd.card.not_ready', undefined, loc));
+        }
+        break;
+      }
+
       case '/help': {
         const botCfg = ds ? getBot(ds.larkAppId).config : getAllBots()[0]?.config;
         const cliName = getCliDisplayName(botCfg?.cliId ?? 'claude-code');
@@ -1051,6 +1068,7 @@ export async function handleCommand(
           t('help.repo_n', undefined, loc),
           t('help.repo_path', undefined, loc),
           t('help.status', undefined, loc),
+          t('help.card', undefined, loc),
           '',
           t('help.heading_passthrough', { cliName }, loc),
           // 直接从集合渲染，保证文案与 PASSTHROUGH_COMMANDS 不漂移

@@ -4,6 +4,7 @@ export const messages: Record<string, string> = {
   'card.btn.open_terminal': '🖥️ Open Terminal',
   'card.btn.open_writable_terminal': '🖥️ Open Writable Terminal',
   'card.btn.get_write_link': '🔑 Get Write Link',
+  'card.writable_terminal_link': '🔑 Writable terminal (visible to everyone here — anyone can drive it): [{url}]({url})',
   'card.btn.restart_cli': '🔄 Restart {cliName}',
   'card.btn.disconnect': '⏏ Disconnect',
   'card.btn.close_session': '❌ Close Session',
@@ -96,6 +97,7 @@ export const messages: Record<string, string> = {
 
   // ─── Command responses ───────────────────────────────────────────────────
   'cmd.no_active_session': 'No active session in this topic.',
+  'cmd.card.not_ready': 'Terminal not ready yet — the streaming card will appear once the session is up.',
   'cmd.restart.in_progress': '🔄 Restarting {cliName}…',
   'cmd.restart.terminated': '{cliName} has been terminated; it will auto-resume on your next message.',
   'cmd.cd.usage': 'Usage: /cd <path>\nExample: /cd ~/projects/my-app',
@@ -176,6 +178,7 @@ export const messages: Record<string, string> = {
   'help.repo_n': '/repo <N>   - Switch to project #N',
   'help.repo_path': '/repo <path|name> - Use a path or a project name under workingDir, skipping the card',
   'help.status': '/status     - Show current session status (incl. terminal URL)',
+  'help.card': '/card       - Manually post the streaming card for this session (summons it even when streaming is off, and resumes live updates)',
   'help.heading_passthrough': '🔀 Passthrough to {cliName} (forwarded verbatim to its built-in slash commands):',
   'help.heading_schedule': '⏰ Scheduled tasks:',
   'help.schedule_create': '/schedule daily 17:50 summarize AI news  - create a scheduled task (natural language)',

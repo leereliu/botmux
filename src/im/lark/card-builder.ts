@@ -210,6 +210,7 @@ export function buildStreamingCard(
   showTakeover?: boolean,
   locale?: Locale,
   usageLimit?: CliUsageLimitState,
+  writableTerminalUrl?: string,
 ): string {
   const effectiveCliId = cliId ?? 'claude-code';
   const cliName = getCliDisplayName(effectiveCliId);
@@ -325,6 +326,17 @@ export function buildStreamingCard(
     });
   }
   elements.push({ tag: 'action', actions: headerActions });
+
+  // ── Writable terminal link (opt-in) ─────────────────────────────────────
+  // When the bot enables `writableTerminalLinkInCard`, embed the token-bearing
+  // link right in the card so anyone here can open a writable terminal without
+  // the get-write-link → DM round-trip. The link is intentionally group-visible.
+  if (writableTerminalUrl) {
+    elements.push({
+      tag: 'markdown',
+      content: t('card.writable_terminal_link', { url: writableTerminalUrl }, locale),
+    });
+  }
 
   // ── Quick-action keys (only when the screenshot is visible — in text mode
   //    there's no visible cursor/input, so these keys would fire blindly) ──
