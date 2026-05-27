@@ -48,7 +48,7 @@ function pageHtml(): string {
 <div class="card" style="margin-bottom:16px">
   <h2 style="margin-top:0">本部署</h2>
   <p>名称：<b id="tf-dep-name">…</b>
-    <button id="tf-rename" class="ghost" style="margin-left:8px">重命名</button></p>
+    <span class="muted" style="font-size:13px;margin-left:6px">（默认用你绑定的飞书名）</span></p>
   <p>我的飞书身份：<b id="tf-owner">未绑定</b>
     <button id="tf-autobind" class="primary" style="margin-left:8px">自动绑定</button>
     <button id="tf-bind" class="ghost" style="margin-left:6px">用 /pair 绑定</button>
@@ -130,7 +130,7 @@ function renderRoster(): void {
     if (!depBots.length) continue;
     const isCol = collapsed.has(dep.id);
     const tag = dep.local ? '本部署' : (dep.stale ? '远端·离线？' : '远端');
-    html += `<div class="tf-grp" data-dep="${escapeHtml(dep.id)}" style="cursor:pointer;margin:10px 0 4px;padding:4px 6px;background:var(--grp-bg,#f6f7f9);border-radius:6px">`
+    html += `<div class="tf-grp" data-dep="${escapeHtml(dep.id)}" style="cursor:pointer;margin:10px 0 4px;padding:4px 6px;background:var(--bg-soft,#f6f7f9);border-radius:6px">`
       + `<b>${isCol ? '▸' : '▾'} ${escapeHtml(dep.name)}</b> <span class="muted" style="font-size:12px">（${tag}）· ${depBots.length} 个</span></div>`;
     if (isCol) continue;
     html += '<table style="width:100%;border-collapse:collapse;font-size:14px"><tbody>';
@@ -299,13 +299,6 @@ export function renderTeamFederationPage(root: HTMLElement): void {
     const app = $('tf-modal').dataset.app!;
     await jput('/api/team/local-bots/' + encodeURIComponent(app) + '/role', { role: ($('tf-modal-text') as HTMLTextAreaElement).value });
     $('tf-modal').style.display = 'none';
-    loadLocal();
-  };
-
-  $('tf-rename').onclick = async () => {
-    const name = prompt('部署名称：', $('tf-dep-name').textContent || '');
-    if (!name || !name.trim()) return;
-    await jpost('/api/team/rename-deployment', { name: name.trim() });
     loadLocal();
   };
 

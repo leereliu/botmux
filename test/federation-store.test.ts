@@ -27,6 +27,17 @@ describe('deployment-identity', () => {
     expect(b.deploymentId).toBe(a.deploymentId); // stable
   });
 
+  it('binding an owner adopts the owner Feishu name as the deployment name', async () => {
+    const { setDeploymentOwner } = await import('../src/services/deployment-identity.js');
+    const a = getDeploymentIdentity(dataDir);
+    const r = setDeploymentOwner(dataDir, { unionId: 'on_x', name: '申晗' });
+    expect(r.ownerUnionId).toBe('on_x');
+    expect(r.ownerName).toBe('申晗');
+    expect(r.name).toBe('申晗');             // deployment label defaults to the Feishu name
+    expect(r.deploymentId).toBe(a.deploymentId);
+    expect(getDeploymentIdentity(dataDir).name).toBe('申晗');
+  });
+
   it('renames without changing the id', () => {
     const a = getDeploymentIdentity(dataDir);
     const r = setDeploymentName(dataDir, '申晗的部署');
