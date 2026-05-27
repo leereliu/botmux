@@ -89,7 +89,17 @@ export async function orchestrateFederatedGroup(
   const missingOperatorIdentity = !operatorUnionId;
 
   const r = await deps.createTeamGroup({ name, larkAppIds, ownerUnionIds });
-  if (r.ok) return { status: 200, body: { ...r, missingOperatorIdentity } };
+  if (r.ok) {
+    // The creator bot adds the owners IT can reach; owners outside its app's
+    // visibility scope (Lark code 232024 — typically owners of OTHER deployments)
+    // come back as invalidOwnerUnionIds. Add each of those via THEIR OWN
+    // deployment's bot (which has them in scope) — hub→spoke delegate-add-owner.
+    let invalidOwners = r.invalidOwnerUnionIds ?? [];
+    if (invalidOwners.length > 0 && r.chatId) {
+      invalidOwners = await delegateAddOwners(dataDir, teamId, r.chatId, invalidOwners, larkAppIds, requestId, deps.fetcher);
+    }
+    return { status: 200, body: { ...r, invalidOwnerUnionIds: invalidOwners, missingOperatorIdentity } };
+  }
 
   // No local online creator → delegate to a reachable deployment that owns a
   // selected bot (hub→spoke). requestId makes each delegate idempotent.
@@ -118,4 +128,38 @@ export async function orchestrateFederatedGroup(
     return { status: 502, body: { ok: false, error: lastErr } };
   }
   return { status: 502, body: r };
+}
+
+/**
+ * For owners the creator couldn't add (out of its app scope), delegate the add
+ * to each owner's OWN deployment: that deployment has a selected bot already in
+ * the chat (`via`) and the owner in its app's visibility scope. Returns the
+ * owners still not added after delegation.
+ */
+async function delegateAddOwners(
+  dataDir: string, teamId: string, chatId: string,
+  owners: string[], selectedAppIds: string[], requestId: string, fetcher: Fetcher,
+): Promise<string[]> {
+  const selected = new Set(selectedAppIds);
+  const stillInvalid = new Set(owners);
+  for (const dep of listFederatedDeployments(dataDir, teamId)) {
+    if (!dep.callbackUrl || !dep.delegationToken) continue;
+    const via = dep.bots.find(b => selected.has(b.larkAppId))?.larkAppId; // a bot of this dep already in the chat
+    if (!via) continue;
+    const mine = owners.filter(u => dep.ownerUnionId === u || dep.bots.some(b => b.ownerUnionId === u));
+    if (mine.length === 0) continue;
+    try {
+      const dr = await fetchWithTimeout(fetcher, `${dep.callbackUrl}/api/federation/delegate-add-owner`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${dep.delegationToken}` },
+        body: JSON.stringify({ chatId, ownerUnionIds: mine, viaLarkAppId: via, requestId }),
+      });
+      const dj = await dr.json().catch(() => ({} as any));
+      if (dr.ok && dj?.ok) {
+        const inv = new Set<string>(dj.invalidUserIds ?? mine);
+        for (const u of mine) if (!inv.has(u)) stillInvalid.delete(u);
+      }
+    } catch { /* unreachable spoke → leave its owners as invalid */ }
+  }
+  return [...stillInvalid];
 }

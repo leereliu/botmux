@@ -243,6 +243,53 @@ describe('handleFederationApi', () => {
     expect(calls).toBe(1);
   });
 
+  it('delegate-add-owner: adds owners via a local bot; token/requestId/guard + idempotent', async () => {
+    writeBots([{ larkAppId: 'cli_a', botOpenId: null, botName: 'A', cliId: 'claude' }]);
+    addMembership(dataDir, { hubUrl: 'http://hub:7891', teamId: 'default', teamName: 'T', syncToken: 'st', deploymentId: 'dep_me', delegationToken: 'DTOK' });
+    let calls = 0;
+    const addOwners = vi.fn(async (_via: string, _chat: string, ids: string[]) => { calls++; return { invalidUserIds: ids.filter(i => i === 'on_bad') }; });
+    const callAO = (req: any, res: any) => handleFederationApi(req, res, new URL('http://x/api/federation/delegate-add-owner'), { dataDir, addOwners });
+    let res = makeRes();
+    await callAO(makeReq('POST', '/api/federation/delegate-add-owner', { chatId: 'oc', viaLarkAppId: 'cli_a', ownerUnionIds: ['on_ok'], requestId: 'r' }, bearer('NOPE')), res);
+    expect(res.statusCode).toBe(403); // unknown token
+    res = makeRes();
+    await callAO(makeReq('POST', '/api/federation/delegate-add-owner', { chatId: 'oc', viaLarkAppId: 'cli_a', ownerUnionIds: ['on_ok'] }, bearer('DTOK')), res);
+    expect(json(res).error).toBe('request_id_required');
+    res = makeRes();
+    await callAO(makeReq('POST', '/api/federation/delegate-add-owner', { chatId: 'oc', viaLarkAppId: 'cli_nope', ownerUnionIds: ['on_ok'], requestId: 'r1' }, bearer('DTOK')), res);
+    expect(json(res).error).toBe('not_a_local_bot');
+    expect(calls).toBe(0);
+    // success: on_bad rejected, on_ok added
+    res = makeRes();
+    await callAO(makeReq('POST', '/api/federation/delegate-add-owner', { chatId: 'oc', viaLarkAppId: 'cli_a', ownerUnionIds: ['on_ok', 'on_bad'], requestId: 'r2' }, bearer('DTOK')), res);
+    expect(res.statusCode).toBe(200);
+    expect(json(res).invalidUserIds).toEqual(['on_bad']);
+    // idempotent replay → same body, addOwners not called again
+    res = makeRes();
+    await callAO(makeReq('POST', '/api/federation/delegate-add-owner', { chatId: 'oc', viaLarkAppId: 'cli_a', ownerUnionIds: ['on_ok', 'on_bad'], requestId: 'r2' }, bearer('DTOK')), res);
+    expect(json(res).invalidUserIds).toEqual(['on_bad']);
+    expect(calls).toBe(1);
+  });
+
+  it('federation/group: a remote owner the creator cant add is delegated to its own deployment', async () => {
+    writeBots([{ larkAppId: 'cli_hub', botOpenId: null, botName: 'Hub', cliId: 'claude' }]);
+    registerDeployment(dataDir, DEFAULT_TEAM_ID, { deploymentId: 'dep_spoke', name: 'Spoke', ownerUnionId: 'on_spoke', bots: [{ larkAppId: 'cli_sp', botName: 'SP', cliId: 'codex', ownerUnionId: 'on_spoke', ownerName: '博文' } as any], callbackUrl: 'http://spoke:7891', delegationToken: 'DT' });
+    const syncToken = (await import('../src/services/federation-store.js')).listFederatedDeployments(dataDir, DEFAULT_TEAM_ID)[0].syncToken;
+    // creator adds bots fine but can't add the remote owner on_spoke (Lark 232024)
+    const createTeamGroup = vi.fn(async () => ({ ok: true, chatId: 'oc_g', invalidBotIds: [], invalidOwnerUnionIds: ['on_spoke'] }));
+    let delegated: any = null;
+    const fetcher = vi.fn(async (u: any, init: any) => {
+      if (String(u).endsWith('/api/federation/delegate-add-owner')) { delegated = JSON.parse(init.body); return { ok: true, status: 200, json: async () => ({ ok: true, invalidUserIds: [] }) } as any; }
+      return { ok: true, status: 200, json: async () => ({}) } as any;
+    });
+    const res = makeRes();
+    await handleFederationApi(makeReq('POST', '/api/federation/group', { name: 'g', larkAppIds: ['cli_hub', 'cli_sp'], requestId: 'g1' }, bearer(syncToken)), res, new URL('http://x/api/federation/group'), { dataDir, createTeamGroup, fetcher: fetcher as any });
+    expect(res.statusCode).toBe(200);
+    expect(json(res).chatId).toBe('oc_g');
+    expect(json(res).invalidOwnerUnionIds).toEqual([]); // on_spoke delegated to dep_spoke → resolved
+    expect(delegated).toMatchObject({ chatId: 'oc_g', viaLarkAppId: 'cli_sp', ownerUnionIds: ['on_spoke'] });
+  });
+
   it('federation/group: token is header-only (rejects ?syncToken= and body token)', async () => {
     writeBots([{ larkAppId: 'cli_hub', botOpenId: null, botName: 'Hub', cliId: 'claude' }]);
     registerDeployment(dataDir, DEFAULT_TEAM_ID, { deploymentId: 'dep_s', name: 'S', ownerUnionId: 'on_s', bots: [{ larkAppId: 'cli_sp', botName: 'SP', cliId: 'codex' }] });

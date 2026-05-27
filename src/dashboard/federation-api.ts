@@ -23,6 +23,21 @@ import { findMembershipByDelegationToken } from '../services/federation-membersh
 import { buildTeamRoster, type LiveBot } from '../services/team-roster.js';
 import { getDeploymentIdentity } from '../services/deployment-identity.js';
 import { orchestrateFederatedGroup, type Fetcher } from './federated-group-core.js';
+import { addUsersToChatByUnionId } from '../services/groups-store.js';
+import { loadBotConfigs, registerBot, getBot } from '../bot-registry.js';
+
+/** Ensure a Lark client exists for larkAppId in THIS (dashboard) process, which
+ *  has no bot registry — register on demand from bots.json (carries the secret).
+ *  Used by delegate-add-owner so it can add a user via a specific local bot. */
+function ensureLocalClient(larkAppId: string): boolean {
+  try { getBot(larkAppId); return true; } catch { /* not registered yet */ }
+  try {
+    const cfg = loadBotConfigs().find(c => c.larkAppId === larkAppId);
+    if (!cfg) return false;
+    registerBot(cfg);
+    return true;
+  } catch { return false; }
+}
 
 const MAX_BOTS = 200;
 const MAX_OWNERS = 100;
@@ -109,6 +124,9 @@ export interface FederationApiDeps {
   createTeamGroup?: (args: { name: string; larkAppIds: string[]; ownerUnionIds?: string[] }) => Promise<{
     ok: boolean; chatId?: string; shareLink?: string; invalidBotIds?: string[]; invalidOwnerUnionIds?: string[]; error?: string;
   }>;
+  /** Add owners to an existing chat via one of OUR local bots (defaults to
+   *  ensure-client + addUsersToChatByUnionId). Test seam. Returns the rejected ids. */
+  addOwners?: (viaLarkAppId: string, chatId: string, ownerUnionIds: string[]) => Promise<{ invalidUserIds: string[] }>;
 }
 
 export async function handleFederationApi(
@@ -255,6 +273,40 @@ export async function handleFederationApi(
     const r = await deps.createTeamGroup({ name, larkAppIds, ownerUnionIds });
     const result = { status: r.ok ? 200 : 502, body: r };
     idemSet(idemKey, result); // cache terminal result (success AND failure)
+    jsonRes(res, result.status, result.body);
+    return true;
+  }
+
+  // Hub asks THIS spoke to add ITS OWN owner(s) to an existing chat (hub→spoke):
+  // the hub's creator bot can't add users outside its app's visibility scope
+  // (Lark code 232024), but THIS deployment's bot has its owner in scope. We add
+  // via `viaLarkAppId` — one of our bots that's already a member of the chat.
+  // Authed by the delegationToken THIS spoke issued (team-internal trust).
+  if (path === '/api/federation/delegate-add-owner' && method === 'POST') {
+    let body: any;
+    try { body = await readBody(req); } catch { jsonRes(res, 400, { ok: false, error: 'bad_json' }); return true; }
+    const token = bearerOnly(req);
+    if (!findMembershipByDelegationToken(dataDir, token)) { jsonRes(res, 403, { ok: false, error: 'unknown_token' }); return true; }
+    const requestId = String(body?.requestId ?? '').trim();
+    if (!requestId) { jsonRes(res, 400, { ok: false, error: 'request_id_required' }); return true; }
+    const idemKey = `add-owner:${token}:${requestId}`;
+    const cached = idemGet(idemKey) as { status: number; body: any } | undefined;
+    if (cached) { jsonRes(res, cached.status, cached.body); return true; }
+    const chatId = String(body?.chatId ?? '').trim();
+    const viaLarkAppId = String(body?.viaLarkAppId ?? '').trim();
+    const rawOwners: unknown[] = Array.isArray(body?.ownerUnionIds) ? body.ownerUnionIds : [];
+    const ownerUnionIds: string[] = Array.from(new Set(rawOwners.filter((x): x is string => typeof x === 'string'))).slice(0, MAX_OWNERS);
+    if (!chatId || ownerUnionIds.length === 0) { jsonRes(res, 400, { ok: false, error: 'bad_request' }); return true; }
+    // Guardrail: viaLarkAppId must be one of OUR local bots.
+    const localIds = new Set(buildTeamRoster(dataDir, undefined, undefined, deps.liveBots?.()).bots.map(b => b.larkAppId));
+    if (!localIds.has(viaLarkAppId)) { jsonRes(res, 400, { ok: false, error: 'not_a_local_bot' }); return true; }
+    const addOwners = deps.addOwners ?? (async (via: string, chat: string, ids: string[]) => {
+      if (!ensureLocalClient(via)) return { invalidUserIds: ids };
+      return addUsersToChatByUnionId(via, chat, ids);
+    });
+    const ar = await addOwners(viaLarkAppId, chatId, ownerUnionIds);
+    const result = { status: 200, body: { ok: true, invalidUserIds: ar.invalidUserIds } };
+    idemSet(idemKey, result);
     jsonRes(res, result.status, result.body);
     return true;
   }
