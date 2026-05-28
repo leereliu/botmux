@@ -25,9 +25,9 @@ function pageHtml(): string {
   return `<section class="page">
 <div class="page-heading">
   <div>
-    <p class="eyebrow">接入点</p>
-    <h1>接入点（Webhook）</h1>
-    <p>让外部系统（监控告警、CI、工单…）通过一个 webhook 触发机器人在群里说话或跑工作流。</p>
+    <p class="eyebrow">接入点 · beta</p>
+    <h1>接入点（Webhook）<span class="muted" style="font-size:14px;font-weight:400">beta</span></h1>
+    <p>让外部系统（监控告警、CI、工单…）通过一个 webhook 触发机器人在群里说话或跑工作流。<span class="muted">（beta：尚未充分测试，欢迎反馈）</span></p>
   </div>
 </div>
 
