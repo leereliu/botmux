@@ -3194,6 +3194,8 @@ body.touch #terminal .xterm-screen *{
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0/lib/addon-fit.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-web-links@0/lib/addon-web-links.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-unicode11@0/lib/addon-unicode11.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-webgl@0/lib/addon-webgl.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-canvas@0/lib/addon-canvas.min.js"></script>
 <script>
 var isTouch='ontouchstart'in window||navigator.maxTouchPoints>0;
 if(isTouch){document.getElementById('vp').content='width=1100,viewport-fit=cover';document.body.classList.add('touch');}
@@ -3214,6 +3216,17 @@ term.loadAddon(new WebLinksAddon.WebLinksAddon());
 term.loadAddon(new Unicode11Addon.Unicode11Addon());
 term.unicode.activeVersion='11';
 term.open(document.getElementById('terminal'));
+// GPU/canvas renderer.  The default DOM renderer repaints every text span on
+// each scroll frame, which is exactly what makes scrolling over text-heavy
+// areas janky/stuck on mobile (blank areas are cheap, so they stayed smooth).
+// Prefer WebGL, fall back to Canvas, then to the built-in DOM renderer.
+try{
+  var _webgl=new WebglAddon.WebglAddon();
+  _webgl.onContextLoss(function(){try{_webgl.dispose()}catch(_){}});
+  term.loadAddon(_webgl);
+}catch(_e){
+  try{term.loadAddon(new CanvasAddon.CanvasAddon())}catch(_e2){}
+}
 fit.fit();
 // ── OSC 52 clipboard ──
 var _clipBuf='';
@@ -3282,18 +3295,6 @@ if(!hasToken&&!${isTmuxMode && !isPipeMode}){
   },{passive:false});
 }
 
-// ── Scroll helper (shared by toolbar buttons & two-finger touch) ──
-function _sendScroll(up,n){
-  n=n||3;
-  if(${isTmuxMode && !isPipeMode}){
-    // SGR mouse wheel: 64=up 65=down — tmux enters copy-mode and scrolls
-    var seq='\\x1b[<'+(up?64:65)+';1;1M';
-    for(var i=0;i<n;i++){if(ws_&&ws_.readyState===1)ws_.send(JSON.stringify({type:'input',data:seq}))}
-  }else{
-    term.scrollLines(up?-n:n);
-  }
-}
-
 // ── Touch shortcut toolbar ──
 if(isTouch&&hasToken){
   var km={esc:'\\x1b',ctrlc:'\\x03',tab:'\\t',up:'\\x1b[A',down:'\\x1b[B',left:'\\x1b[D',right:'\\x1b[C',enter:'\\r'};
@@ -3321,38 +3322,11 @@ if(isTouch&&hasToken){
   }
 }
 
-// ── Single-finger touch scroll (mobile) ──
-// One finger dragging scrolls the terminal, following the finger 1:1 with no
-// elastic bounce or momentum jank.  Two+ fingers are left to the browser so
-// pinch-zoom still works for reading small text.
-//   • pipe / non-tmux: drive .xterm-viewport.scrollTop directly → pixel-smooth.
-//   • legacy tmux copy-mode (scrollback lives in tmux, not xterm): translate
-//     the drag into wheel sequences via _sendScroll, accumulating per line.
-if(isTouch){
-  var _tmuxScroll=${isTmuxMode && !isPipeMode};
-  var _vp=document.querySelector('#terminal .xterm-viewport');
-  var _tEl=document.getElementById('terminal');
-  var _tLastY=0,_tActive=false,_tAcc=0;
-  _tEl.addEventListener('touchstart',function(e){
-    if(e.touches.length!==1){_tActive=false;return;}  // multi-touch → let browser pinch-zoom
-    _tActive=true;_tLastY=e.touches[0].clientY;_tAcc=0;
-  },{passive:true});
-  _tEl.addEventListener('touchmove',function(e){
-    if(!_tActive||e.touches.length!==1)return;
-    var y=e.touches[0].clientY,dy=y-_tLastY;_tLastY=y;
-    if(_tmuxScroll){
-      _tAcc+=dy;var step=22;  // ~1.3 lines per wheel-equiv; smaller = smoother
-      while(Math.abs(_tAcc)>=step){_sendScroll(_tAcc>0,1);_tAcc-=(_tAcc>0?step:-step);}
-    }else if(_vp){
-      _vp.scrollTop-=dy;  // drag down → reveal older content; scrollTop clamps, no bounce
-    }else{
-      term.scrollLines(dy>0?-1:1);
-    }
-    e.preventDefault();  // hard-kill native scroll/bounce/momentum
-  },{passive:false});
-  _tEl.addEventListener('touchend',function(){_tActive=false});
-  _tEl.addEventListener('touchcancel',function(){_tActive=false});
-}
+// Single-finger touch scrolling is handled natively by xterm's own Viewport
+// (handleTouchMove → scrollTop), so no custom handler here — a parallel one
+// would double-drive scrollTop and fight xterm.  overscroll-behavior:none on
+// .xterm-viewport (see <style>) kills the iOS rubber-band; the WebGL/Canvas
+// renderer above is what actually makes scrolling over text smooth.
 </script>
 </body>
 </html>`;
