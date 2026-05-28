@@ -11,6 +11,7 @@
 import { buildFederatedRoster } from '../services/federation-roster.js';
 import { listFederatedDeployments } from '../services/federation-store.js';
 import { DEFAULT_TEAM_ID } from '../services/team-store.js';
+import { logger } from '../utils/logger.js';
 import type { LiveBot } from '../services/team-roster.js';
 
 const HUB_TIMEOUT_MS = 8000;
@@ -158,17 +159,22 @@ async function delegateAddOwners(
     const mine = owners.filter(u => dep.ownerUnionId === u || dep.bots.some(b => b.ownerUnionId === u));
     if (mine.length === 0) continue;
     try {
+      logger.info(`[federation] delegate-add-owner → ${dep.name} (${dep.callbackUrl}) via=${via} owners=${mine.length}`);
       const dr = await fetchWithTimeout(fetcher, `${dep.callbackUrl}/api/federation/delegate-add-owner`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', authorization: `Bearer ${dep.delegationToken}` },
         body: JSON.stringify({ chatId, ownerUnionIds: mine, viaLarkAppId: via, requestId }),
       });
       const dj = await dr.json().catch(() => ({} as any));
+      logger.info(`[federation] delegate-add-owner ← ${dep.name}: status=${dr.status} ok=${dj?.ok} invalid=${JSON.stringify(dj?.invalidUserIds ?? 'all')}`);
       if (dr.ok && dj?.ok) {
         const inv = new Set<string>(dj.invalidUserIds ?? mine);
         for (const u of mine) if (!inv.has(u)) stillInvalid.delete(u);
       }
-    } catch { /* unreachable spoke → leave its owners as invalid */ }
+    } catch (e: any) {
+      logger.warn(`[federation] delegate-add-owner threw for ${dep.name} (${dep.callbackUrl}): ${e?.message ?? e}`);
+    }
   }
+  if (stillInvalid.size) logger.warn(`[federation] delegateAddOwners: ${stillInvalid.size} owner(s) still not added: ${[...stillInvalid].join(',')}`);
   return [...stillInvalid];
 }
