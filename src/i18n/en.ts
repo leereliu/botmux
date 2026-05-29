@@ -432,6 +432,8 @@ export const messages: Record<string, string> = {
   'start.autostart_synced': '   autostart unit synced to current Node/cli.js paths',
 
   // ─── Daemon runtime notices ──────────────────────────────────────────────
+  'daemon.auto_start_join_title': 'Proactive start (joined chat)',
+  'daemon.auto_start_join_seed': '🚀 Joined this chat — getting to work…',
   'daemon.cmd_requires_session': '{cmd} requires an existing session (send a normal message first to start the CLI).',
   'daemon.cmd_allowed_users_only': '⚠️ {cmd} is restricted to `allowedUsers`.',
   'daemon.download_failed_need_login': '⚠️ Some images/files failed to download (missing User Token). Send `/login` in this topic to authorize, then resend.',

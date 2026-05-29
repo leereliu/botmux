@@ -268,6 +268,39 @@ export async function getChatInfo(larkAppId: string, chatId: string): Promise<{ 
 }
 
 /**
+ * List the open_ids of a chat's (user) members, paginating until exhausted.
+ * Used by the 主动开工 场景① gate to check whether any of the bot's allowedUsers
+ * is a member of a chat the bot was just added to. Open_ids are app-scoped, so
+ * the result is only comparable against the SAME bot's resolvedAllowedUsers.
+ *
+ * Throws on API failure (e.g. missing `im:chat`/member-read scope) so the
+ * caller can decide how to degrade — it does NOT swallow errors, because a
+ * silent empty list would look like "no allowedUser present" and wrongly
+ * suppress auto-start.
+ */
+export async function listChatMemberOpenIds(larkAppId: string, chatId: string): Promise<string[]> {
+  const c = getBotClient(larkAppId);
+  const openIds: string[] = [];
+  let pageToken: string | undefined;
+  // Hard page cap as a runaway guard (100 members/page × 20 = 2000 members).
+  for (let page = 0; page < 20; page++) {
+    const params: Record<string, string> = { member_id_type: 'open_id', page_size: '100' };
+    if (pageToken) params.page_token = pageToken;
+    const res = await larkGet(c, `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/members`, params);
+    if (res.code !== 0) {
+      throw new Error(`Failed to list chat members: ${res.msg} (code: ${res.code})`);
+    }
+    for (const it of (res.data?.items ?? [])) {
+      const id = it?.member_id;
+      if (typeof id === 'string' && id) openIds.push(id);
+    }
+    if (!res.data?.has_more || !res.data?.page_token) break;
+    pageToken = res.data.page_token;
+  }
+  return openIds;
+}
+
+/**
  * Resolve a chat's display name (the user-facing group title). Returns `null`
  * on any failure (chatId is unknown to this bot, network error, bot not in
  * chat etc.) — callers should fall back to displaying the raw chatId so the

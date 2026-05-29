@@ -11,6 +11,7 @@ import { config } from '../../config.js';
 import { getChatInfo, getChatMode, listChatBotMembers, replyMessage, sendUserMessage, isHumanOpenId } from './client.js';
 import { logger } from '../../utils/logger.js';
 import { parseForceTopicInvocation } from '../../core/command-handler.js';
+import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
 import { stripLeadingMentions } from './message-parser.js';
 import { recordObservedBots } from '../../services/observed-bots-store.js';
 import { BOTMUX_REQUIRED_SCOPES, buildScopeDeepLink } from '../../setup/verify-permissions.js';
@@ -618,6 +619,11 @@ export interface EventHandlers {
   handleCardAction: (data: any, larkAppId: string) => Promise<any>;
   handleNewTopic: (data: any, ctx: RoutingContext) => Promise<void>;
   handleThreadReply: (data: any, ctx: RoutingContext) => Promise<void>;
+  /** 主动开工 — 场景①: fired when this bot is added to a chat
+   *  (`im.chat.member.bot.added_v1`). The daemon decides whether to auto-start
+   *  based on the bot's `autoStartOnGroupJoin` toggle + allowedUser membership.
+   *  Best-effort fire-and-forget. `operatorOpenId` is who added the bot. */
+  handleBotAdded?: (chatId: string, operatorOpenId: string | undefined, larkAppId: string) => Promise<void>;
   /** Check if this bot owns an active session anchored at the given id
    *  (rootMessageId for thread-scope, chatId for chat-scope). */
   isSessionOwner?: (anchor: string, larkAppId: string) => boolean;
@@ -760,6 +766,20 @@ export async function decideRouting(
  */
 export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: string, handlers: EventHandlers): Lark.WSClient {
   const eventDispatcher = new Lark.EventDispatcher({}).register({
+    // 主动开工 — 场景①: the bot was added to a chat. Hand off to the daemon,
+    // which gates on the autoStartOnGroupJoin toggle + allowedUser membership.
+    // Requires this event to be subscribed for the app in the Feishu console.
+    'im.chat.member.bot.added_v1': async (data: any) => {
+      try {
+        const chatId: string | undefined = data?.chat_id;
+        const operatorOpenId: string | undefined = data?.operator_id?.open_id;
+        if (!chatId) return;
+        logger.info(`[auto-start:入群] bot added to chat=${chatId.substring(0, 12)} by ${String(operatorOpenId ?? '?').substring(0, 12)}`);
+        await handlers.handleBotAdded?.(chatId, operatorOpenId, larkAppId);
+      } catch (err) {
+        logger.error(`Error handling bot-added event: ${err}`);
+      }
+    },
     'card.action.trigger': async (data: any) => {
       try {
         const result = await handlers.handleCardAction(data, larkAppId);
@@ -980,8 +1000,23 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
               return;
             }
             if (access === 'ignore') {
-              logger.debug(`Ignoring group message not addressed to bot: ${messageId}`);
-              return;
+              // 主动开工 — 场景②: a non-@ message that seeds a brand-new topic in
+              // a 话题群 auto-starts a session when the bot opted in. Everything
+              // else (regular-group chatter, thread replies, disabled bots) keeps
+              // the original ignore. Sender is intentionally not gated (D4).
+              const autoTopic = shouldAutoStartOnNewTopic({
+                enabled: getBot(larkAppId).config.autoStartOnNewTopic === true,
+                scope: routing.scope,
+                anchor: routing.anchor,
+                messageId,
+                chatType,
+                ownsSession,
+              });
+              if (!autoTopic) {
+                logger.debug(`Ignoring group message not addressed to bot: ${messageId}`);
+                return;
+              }
+              logger.info(`[auto-start:新话题] ${chatId.substring(0, 12)} 新话题免@自动开工 msg=${messageId.substring(0, 12)}`);
             }
           }
         } else if (!isAllowed) {

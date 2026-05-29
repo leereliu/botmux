@@ -137,6 +137,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
         ${renderRoleSection(b)}
         ${renderBrandSection(b)}
         ${renderCardBehaviorSection(b)}
+        ${renderAutoStartSection(b)}
       </div>
     </article>`;
   }
@@ -221,6 +222,41 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
       <div class="actions">
         <small data-card-pref-moot class="hint-warn-inline" ${disableStreaming ? '' : 'hidden'}>${t('botDefaults.writableLinkMoot')}</small>
         <span class="oncall-status" data-card-pref-status></span>
+      </div>
+    </section>`;
+  }
+
+  // 主动开工 — two opt-in triggers. The two checkboxes auto-save on change; the
+  // 场景① prompt has its own save button (a textarea shouldn't PUT per keystroke).
+  function renderAutoStartSection(b: any): string {
+    const onJoin = b.autoStartOnGroupJoin === true;
+    const onTopic = b.autoStartOnNewTopic === true;
+    const joinPrompt: string = typeof b.autoStartOnGroupJoinPrompt === 'string' ? b.autoStartOnGroupJoinPrompt : '';
+    return `<section class="bd-section">
+      <h3 class="bd-section-title">${t('botDefaults.sectionAutoStart')}</h3>
+      <label class="checkbox-row">
+        <input type="checkbox" data-action="toggle-auto-join" ${onJoin ? 'checked' : ''}>
+        <strong>${t('botDefaults.autoStartJoin')}</strong>
+        <small>${t('botDefaults.autoStartJoinHelp')}</small>
+      </label>
+      <div class="bd-row">
+        <label>
+          <span>${t('botDefaults.autoStartJoinPrompt')}</span>
+          <textarea data-input="autoJoinPrompt" rows="3"
+            placeholder="${escapeHtml(t('botDefaults.autoStartJoinPromptPlaceholder'))}"
+            style="width:100%;box-sizing:border-box;font:13px/1.5 ui-monospace,Menlo,monospace;padding:10px">${escapeHtml(joinPrompt)}</textarea>
+        </label>
+        <div class="actions">
+          <button type="button" data-action="save-auto-join-prompt">${t('botDefaults.autoStartJoinPromptSave')}</button>
+        </div>
+      </div>
+      <label class="checkbox-row">
+        <input type="checkbox" data-action="toggle-auto-topic" ${onTopic ? 'checked' : ''}>
+        <strong>${t('botDefaults.autoStartTopic')}</strong>
+        <small>${t('botDefaults.autoStartTopicHelp')}</small>
+      </label>
+      <div class="actions">
+        <span class="oncall-status" data-auto-start-status></span>
       </div>
     </section>`;
   }
@@ -343,13 +379,19 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
       const cardPrefStatusEl = card.querySelector<HTMLSpanElement>('[data-card-pref-status]');
       const cardPrefMootEl = card.querySelector<HTMLElement>('[data-card-pref-moot]');
 
-      // PUT a partial card-prefs patch; `selfCb` is the checkbox that triggered
-      // it (disabled during the request to block double-submit).
-      async function putCardPref(patch: Record<string, boolean>, selfCb: HTMLInputElement) {
-        if (!cardPrefStatusEl) return;
-        cardPrefStatusEl.textContent = '';
-        cardPrefStatusEl.className = 'oncall-status';
-        selfCb.disabled = true;
+      // PUT a partial card-prefs patch (booleans and/or the auto-start prompt
+      // string). `selfEl` is the control that triggered it (disabled during the
+      // request to block double-submit); `statusEl` is where the result toast
+      // lands (defaults to the card-behaviour status line).
+      async function putCardPref(
+        patch: Record<string, boolean | string>,
+        selfEl: HTMLInputElement | HTMLButtonElement,
+        statusEl: HTMLElement | null = cardPrefStatusEl,
+      ) {
+        if (!statusEl) return;
+        statusEl.textContent = '';
+        statusEl.className = 'oncall-status';
+        selfEl.disabled = true;
         try {
           const r = await fetch(`/api/bots/${encodeURIComponent(appId)}/card-prefs`, {
             method: 'PUT',
@@ -358,25 +400,28 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
           });
           const body = await r.json().catch(() => ({}));
           if (r.ok && body.ok) {
-            cardPrefStatusEl.textContent = `✓ ${t('botDefaults.cardPrefSaved')}`;
-            cardPrefStatusEl.classList.add('hint-ok');
+            statusEl.textContent = `✓ ${t('botDefaults.cardPrefSaved')}`;
+            statusEl.classList.add('hint-ok');
             const cached = cache.bots.find((bb: any) => bb.larkAppId === appId);
             if (cached) {
               cached.disableStreamingCard = body.disableStreamingCard;
               cached.writableTerminalLinkInCard = body.writableTerminalLinkInCard;
               cached.privateCard = body.privateCard;
+              cached.autoStartOnGroupJoin = body.autoStartOnGroupJoin;
+              cached.autoStartOnGroupJoinPrompt = body.autoStartOnGroupJoinPrompt;
+              cached.autoStartOnNewTopic = body.autoStartOnNewTopic;
             }
           } else {
-            cardPrefStatusEl.textContent = `✗ ${body.error ?? r.status}`;
-            cardPrefStatusEl.classList.add('hint-warn-inline');
+            statusEl.textContent = `✗ ${body.error ?? r.status}`;
+            statusEl.classList.add('hint-warn-inline');
           }
         } catch (e: any) {
-          cardPrefStatusEl.textContent = `✗ ${e?.message ?? e}`;
-          cardPrefStatusEl.classList.add('hint-warn-inline');
+          statusEl.textContent = `✗ ${e?.message ?? e}`;
+          statusEl.classList.add('hint-warn-inline');
         } finally {
           // The writable-link checkbox stays disabled while streaming is off.
-          if (selfCb === writableLinkCb) selfCb.disabled = !!disableStreamingCb?.checked;
-          else selfCb.disabled = false;
+          if (selfEl === writableLinkCb) selfEl.disabled = !!disableStreamingCb?.checked;
+          else selfEl.disabled = false;
         }
       }
 
@@ -397,6 +442,28 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
       if (privateCardCb) {
         privateCardCb.addEventListener('change', () => {
           putCardPref({ privateCard: privateCardCb.checked }, privateCardCb);
+        });
+      }
+
+      // ── 主动开工 toggles + 场景① prompt ───────────────────────────────────
+      const autoJoinCb = card.querySelector<HTMLInputElement>('input[data-action=toggle-auto-join]');
+      const autoTopicCb = card.querySelector<HTMLInputElement>('input[data-action=toggle-auto-topic]');
+      const autoJoinPromptEl = card.querySelector<HTMLTextAreaElement>('textarea[data-input=autoJoinPrompt]');
+      const autoJoinPromptSaveBtn = card.querySelector<HTMLButtonElement>('button[data-action=save-auto-join-prompt]');
+      const autoStartStatusEl = card.querySelector<HTMLSpanElement>('[data-auto-start-status]');
+      if (autoJoinCb) {
+        autoJoinCb.addEventListener('change', () => {
+          putCardPref({ autoStartOnGroupJoin: autoJoinCb.checked }, autoJoinCb, autoStartStatusEl);
+        });
+      }
+      if (autoTopicCb) {
+        autoTopicCb.addEventListener('change', () => {
+          putCardPref({ autoStartOnNewTopic: autoTopicCb.checked }, autoTopicCb, autoStartStatusEl);
+        });
+      }
+      if (autoJoinPromptEl && autoJoinPromptSaveBtn) {
+        autoJoinPromptSaveBtn.addEventListener('click', () => {
+          putCardPref({ autoStartOnGroupJoinPrompt: autoJoinPromptEl.value }, autoJoinPromptSaveBtn, autoStartStatusEl);
         });
       }
 

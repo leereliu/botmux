@@ -119,6 +119,28 @@ export interface BotConfig {
    * `/card` group-visible & live.
    */
   privateCard?: boolean;
+  /**
+   * 主动开工 — 场景①. When true, the bot auto-starts a session when it is added
+   * to a new chat that contains at least one of its allowedUsers (see
+   * docs/specs/20260529-proactive-auto-start/). Default (undefined) = passive
+   * (only spawns on @mention). Requires the `im.chat.member.bot.added_v1` event
+   * to be subscribed for the app in the Feishu console.
+   */
+  autoStartOnGroupJoin?: boolean;
+  /**
+   * 主动开工 — 场景① optional pre-configured first-turn prompt. When set, it
+   * becomes the user_message of the auto-started session; when unset/blank the
+   * session starts with an empty user_message and the bot reads the group
+   * context itself. Moot when {@link autoStartOnGroupJoin} is off.
+   */
+  autoStartOnGroupJoinPrompt?: string;
+  /**
+   * 主动开工 — 场景②. When true, in a 话题群 (topic mode) every new topic's first
+   * message auto-starts a session even without an @mention (the default role +
+   * the user's first message form the prompt). No effect in regular groups.
+   * Default (undefined) = passive.
+   */
+  autoStartOnNewTopic?: boolean;
 }
 
 export interface BotState {
@@ -465,6 +487,13 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       disableStreamingCard: entry.disableStreamingCard === true || undefined,
       writableTerminalLinkInCard: entry.writableTerminalLinkInCard === true || undefined,
       privateCard: entry.privateCard === true || undefined,
+      autoStartOnGroupJoin: entry.autoStartOnGroupJoin === true || undefined,
+      // Preserve the configured prompt verbatim; trim-to-undefined when blank
+      // so an empty string doesn't linger in bots.json.
+      autoStartOnGroupJoinPrompt: typeof entry.autoStartOnGroupJoinPrompt === 'string' && entry.autoStartOnGroupJoinPrompt.trim()
+        ? entry.autoStartOnGroupJoinPrompt
+        : undefined,
+      autoStartOnNewTopic: entry.autoStartOnNewTopic === true || undefined,
     });
   }
 

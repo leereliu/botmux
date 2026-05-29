@@ -435,6 +435,8 @@ export const messages: Record<string, string> = {
   'start.autostart_synced': '   autostart unit 已同步到当前 Node/cli.js 路径',
 
   // ─── Daemon runtime notices ──────────────────────────────────────────────
+  'daemon.auto_start_join_title': '主动开工（入群）',
+  'daemon.auto_start_join_seed': '🚀 已加入本群，开始工作…',
   'daemon.cmd_requires_session': '{cmd} 需要在已有会话内使用（先发一条普通消息启动 CLI）。',
   'daemon.cmd_allowed_users_only': '⚠️ {cmd} 仅 allowedUsers 可执行。',
   'daemon.download_failed_need_login': '⚠️ 部分图片/文件下载失败（缺少 User Token）。请在话题中发送 /login 授权后重新发送。',

@@ -612,6 +612,9 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     disableStreamingCard: cardPrefs.disableStreamingCard,
     writableTerminalLinkInCard: cardPrefs.writableTerminalLinkInCard,
     privateCard: cardPrefs.privateCard,
+    autoStartOnGroupJoin: cardPrefs.autoStartOnGroupJoin,
+    autoStartOnGroupJoinPrompt: cardPrefs.autoStartOnGroupJoinPrompt,
+    autoStartOnNewTopic: cardPrefs.autoStartOnNewTopic,
   });
 });
 
@@ -619,14 +622,23 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
 // present keys are applied. `{ disableStreamingCard?, writableTerminalLinkInCard?, privateCard? }`.
 ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
-  let body: { disableStreamingCard?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown };
+  let body: {
+    disableStreamingCard?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown;
+    autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnNewTopic?: unknown;
+  };
   try { body = await readJsonBody(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
 
-  const patch: { disableStreamingCard?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean } = {};
+  const patch: {
+    disableStreamingCard?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean;
+    autoStartOnGroupJoin?: boolean; autoStartOnGroupJoinPrompt?: string; autoStartOnNewTopic?: boolean;
+  } = {};
   if (typeof body.disableStreamingCard === 'boolean') patch.disableStreamingCard = body.disableStreamingCard;
   if (typeof body.writableTerminalLinkInCard === 'boolean') patch.writableTerminalLinkInCard = body.writableTerminalLinkInCard;
   if (typeof body.privateCard === 'boolean') patch.privateCard = body.privateCard;
+  if (typeof body.autoStartOnGroupJoin === 'boolean') patch.autoStartOnGroupJoin = body.autoStartOnGroupJoin;
+  if (typeof body.autoStartOnGroupJoinPrompt === 'string') patch.autoStartOnGroupJoinPrompt = body.autoStartOnGroupJoinPrompt;
+  if (typeof body.autoStartOnNewTopic === 'boolean') patch.autoStartOnNewTopic = body.autoStartOnNewTopic;
   if (Object.keys(patch).length === 0) return jsonRes(res, 400, { ok: false, error: 'no_valid_fields' });
 
   const r = await cardPrefsStore.updateBotCardPrefs(cachedLarkAppId, patch);

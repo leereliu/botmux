@@ -8,7 +8,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 import { config } from './config.js';
 import { statSync } from 'node:fs';
-import { getChatMode, replyMessage, resolveAllowedUsersWithMap, sendMessage, updateMessage } from './im/lark/client.js';
+import { getChatMode, listChatMemberOpenIds, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage } from './im/lark/client.js';
+import { chatHasAllowedUser, resolveGroupJoinPrompt } from './core/auto-start.js';
 import { loadBotConfigs, registerBot, getBot, getAllBots, findOncallChatForAnyBot, type BotState, type OncallChat } from './bot-registry.js';
 import * as sessionStore from './services/session-store.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
@@ -1925,6 +1926,180 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   }
 }
 
+// 主动开工 — 场景①: in-flight lock so two near-simultaneous `bot.added` events
+// for the same chat (reconnect replay / double-delivery) can't both spawn —
+// claimed synchronously before the first await, released in `finally` (FR-13).
+// We deliberately do NOT keep a process-lifetime "already started" set: that
+// would block a legitimate re-add after the user `/close`s the session. While a
+// session is live, `activeSessions` is the dedup; once closed, re-adding the
+// bot starts fresh.
+const autoStartJoinInFlight = new Set<string>();
+// 主动开工 — 场景① FR-12: only nag the admin once per process when listing chat
+// members fails (most likely a missing `im:chat` member-read scope), so a bot
+// added to many chats doesn't spam DMs.
+const groupJoinScopeWarned = new Set<string>();
+
+async function warnGroupJoinScopeOnce(larkAppId: string, detail: string): Promise<void> {
+  if (groupJoinScopeWarned.has(larkAppId)) return;
+  groupJoinScopeWarned.add(larkAppId);
+  const bot = getBot(larkAppId);
+  const adminOpenId = bot.resolvedAllowedUsers.find(u => u.startsWith('ou_'));
+  if (!adminOpenId) {
+    logger.warn(`[auto-start:入群] ${larkAppId} 缺权限提示无法私信（allowedUsers 无 open_id），仅记录日志`);
+    return;
+  }
+  const dm =
+    `⚠️ botmux「被拉进新群自动开工」已开启，但读取群成员失败，无法判断群里是否有授权用户，自动开工被跳过。\n\n` +
+    `最可能原因：缺少读取群成员的权限（im:chat / 群信息读取），或没有订阅「机器人进群」事件 \`im.chat.member.bot.added_v1\`。\n\n` +
+    `请到飞书开放平台 → 应用 → 权限管理 / 事件订阅 里补齐，然后 \`botmux restart\`。\n\n错误详情：${detail}`;
+  try {
+    await sendUserMessage(larkAppId, adminOpenId, dm, 'text');
+    logger.info(`[auto-start:入群] ${larkAppId} 已私信 admin 提示补权限`);
+  } catch (err) {
+    logger.warn(`[auto-start:入群] ${larkAppId} 私信 admin 失败：${err}`);
+  }
+}
+
+/**
+ * 主动开工 — 场景①: the bot was added to a chat. Auto-start a session when
+ * (1) the bot opted in via `autoStartOnGroupJoin`, and (2) at least one of its
+ * allowedUsers is a member of the chat (D7). Working dir per D6: the bot's
+ * default working dir, else degrade to the repo-selection card. The first-turn
+ * prompt is the configured prompt, or empty (the role/identity envelope still
+ * makes it a non-empty CLI turn — the bot reads the group context itself, D8).
+ *
+ * Scope is mode-aware: a 普通群 gets a chat-scope session anchored at chatId; a
+ * 话题群 (topic mode) has no thread to attach to yet, so we seed a fresh topic
+ * (a top-level message) and run a thread-scope session anchored at that seed —
+ * otherwise a chat-scope session in a 话题群 is the known stale-session bug
+ * (every reply would wrap into a new topic, and later messages route elsewhere).
+ */
+async function handleBotAdded(chatId: string, operatorOpenId: string | undefined, larkAppId: string): Promise<void> {
+  const bot = getBot(larkAppId);
+  const botCfg = bot.config;
+  if (botCfg.autoStartOnGroupJoin !== true) {
+    logger.debug(`[auto-start:入群] ${chatId.substring(0, 12)} 开关未开，忽略`);
+    return;
+  }
+
+  const lockKey = `${larkAppId}:join:${chatId}`;
+  if (autoStartJoinInFlight.has(lockKey) || activeSessions.has(sessionKey(chatId, larkAppId))) {
+    logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 已在处理/已有会话，跳过（去重）`);
+    return;
+  }
+  autoStartJoinInFlight.add(lockKey);
+  try {
+    // D7 gate: an allowedUser must be a member of the chat.
+    let memberOpenIds: string[];
+    try {
+      memberOpenIds = await listChatMemberOpenIds(larkAppId, chatId);
+    } catch (err: any) {
+      logger.warn(`[auto-start:入群] ${chatId.substring(0, 12)} 拉群成员失败：${err?.message ?? err}`);
+      await warnGroupJoinScopeOnce(larkAppId, String(err?.message ?? err));
+      return;
+    }
+    if (!chatHasAllowedUser(memberOpenIds, bot.resolvedAllowedUsers)) {
+      logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 群内无 allowedUser 成员，忽略`);
+      return;
+    }
+
+    const chatType: 'group' = 'group';
+    const mode = await getChatMode(larkAppId, chatId);
+    const promptBody = resolveGroupJoinPrompt(botCfg.autoStartOnGroupJoinPrompt);
+    const title = (promptBody || tr('daemon.auto_start_join_title', undefined, localeForBot(larkAppId))).substring(0, 50);
+
+    // Pick scope + anchor. 话题群 → seed a topic and anchor thread-scope there;
+    // 普通群 → chat-scope anchored at chatId.
+    let scope: 'thread' | 'chat';
+    let anchor: string;
+    if (mode === 'topic') {
+      const seedText = tr('daemon.auto_start_join_seed', undefined, localeForBot(larkAppId));
+      anchor = await sendMessage(larkAppId, chatId, seedText, 'text');
+      scope = 'thread';
+    } else {
+      anchor = chatId;
+      scope = 'chat';
+    }
+    const dsKey = sessionKey(anchor, larkAppId);
+    if (activeSessions.has(dsKey)) {
+      logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 锚点已有会话，跳过`);
+      return;
+    }
+
+    const { pinnedWorkingDir } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+    refreshCliVersion(botCfg.cliId, botCfg.cliPathOverride);
+
+    const session = sessionStore.createSession(chatId, anchor, title, chatType);
+    const now = Date.now();
+    session.larkAppId = larkAppId;
+    session.ownerOpenId = operatorOpenId;
+    session.lastCallerOpenId = operatorOpenId;
+    session.lastMessageAt = new Date(now).toISOString();
+    session.scope = scope;
+    if (pinnedWorkingDir) session.workingDir = pinnedWorkingDir;
+    sessionStore.updateSession(session);
+    messageQueue.ensureQueue(anchor);
+
+    const ds: DaemonSession = {
+      session,
+      worker: null,
+      workerPort: null,
+      workerToken: null,
+      larkAppId,
+      chatId,
+      chatType,
+      scope,
+      spawnedAt: Date.parse(session.createdAt) || now,
+      cliVersion: cliVersionCache.get(botCfg.cliId)?.version ?? 'unknown',
+      lastMessageAt: now,
+      hasHistory: false,
+      pendingRepo: !pinnedWorkingDir,
+      pendingPrompt: promptBody,
+      ownerOpenId: operatorOpenId,
+      currentTurnTitle: title,
+      workingDir: pinnedWorkingDir,
+    };
+    activeSessions.set(dsKey, ds);
+
+    const selfBot = getBot(larkAppId);
+    const buildPrompt = async () => buildNewTopicPrompt(
+      promptBody, session.sessionId, botCfg.cliId, botCfg.cliPathOverride,
+      undefined, undefined, await getAvailableBots(larkAppId, chatId), undefined,
+      { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), undefined,
+      { larkAppId, chatId },
+    );
+
+    // Pinned working dir → spawn immediately.
+    if (pinnedWorkingDir) {
+      if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
+      const prompt = await buildPrompt();
+      rememberLastCliInput(ds, promptBody, prompt);
+      forkWorker(ds, prompt);
+      logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 自动开工（${mode}/${scope}），workingDir=${pinnedWorkingDir}`);
+      return;
+    }
+
+    // No default dir → degrade to repo-selection card (D6 / FR-4).
+    if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
+    const scanDirs = getProjectScanDirs(ds).filter(d => existsSync(d));
+    const projects = scanDirs.length > 0 ? scanMultipleProjects(scanDirs) : [];
+    if (projects.length > 0) {
+      lastRepoScan.set(chatId, projects);
+      const cardJson = buildRepoSelectCard(projects, getSessionWorkingDir(ds), anchor, localeForBot(larkAppId));
+      ds.repoCardMessageId = await sessionReply(anchor, cardJson, 'interactive', larkAppId);
+      logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 无默认目录，弹 repo 选择卡（${projects.length} 个项目）`);
+    } else {
+      ds.pendingRepo = false;
+      const prompt = await buildPrompt();
+      rememberLastCliInput(ds, promptBody, prompt);
+      forkWorker(ds, prompt);
+      logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 无默认目录且无可选项目，直接开工`);
+    }
+  } finally {
+    autoStartJoinInFlight.delete(lockKey);
+  }
+}
+
 /** Reverse-lookup a foreign bot's display name for a sender open_id observed on
  *  this app's WS events. Priority:
  *    1) bot-openids-${larkAppId}.json — per-app cross-ref populated by
@@ -2573,11 +2748,23 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       logger.debug(`[${cfg.larkAppId}] required-scope check failed: ${err?.message ?? err}`);
     });
 
+    // 主动开工 — 场景①: the bot.added event can't be self-verified via API, and
+    // if it isn't subscribed the handler simply never fires (no runtime signal).
+    // Surface a startup breadcrumb whenever the toggle is on so a misconfigured
+    // event subscription is at least visible in the logs.
+    if (cfg.autoStartOnGroupJoin) {
+      logger.info(
+        `[auto-start:入群] ${cfg.larkAppId} autoStartOnGroupJoin 已开启 —— ` +
+        `请确认飞书开放平台已订阅事件 im.chat.member.bot.added_v1 且开通群成员读取权限，否则被拉群不会触发。`,
+      );
+    }
+
     // Start event dispatcher for this bot
     startLarkEventDispatcher(cfg.larkAppId, cfg.larkAppSecret, {
       handleCardAction: (data, appId) => handleCardAction(data, cardDeps, appId),
       handleNewTopic: (data, ctx) => handleNewTopic(data, ctx),
       handleThreadReply: (data, ctx) => handleThreadReply(data, ctx),
+      handleBotAdded: (chatId, operatorOpenId, appId) => handleBotAdded(chatId, operatorOpenId, appId),
       isSessionOwner: (anchor, appId) => activeSessions.has(sessionKey(anchor, appId)),
       // Chat was converted 普通群 → 话题群 while we held a chat-scope session.
       // Evict it from the routing map so subsequent inbound messages can land

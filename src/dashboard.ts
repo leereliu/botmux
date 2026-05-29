@@ -745,6 +745,9 @@ const server = createServer(async (req, res) => {
             disableStreamingCard: j.disableStreamingCard === true,
             writableTerminalLinkInCard: j.writableTerminalLinkInCard === true,
             privateCard: j.privateCard === true,
+            autoStartOnGroupJoin: j.autoStartOnGroupJoin === true,
+            autoStartOnGroupJoinPrompt: typeof j.autoStartOnGroupJoinPrompt === 'string' ? j.autoStartOnGroupJoinPrompt : '',
+            autoStartOnNewTopic: j.autoStartOnNewTopic === true,
           };
         } catch (e: any) {
           return { larkAppId: d.larkAppId, botName: d.botName, online: true, error: e?.message ?? String(e) };
