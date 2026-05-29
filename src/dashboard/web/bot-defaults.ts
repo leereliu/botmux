@@ -134,10 +134,34 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
             <span class="oncall-status" data-status></span>
           </div>
         </section>
+        ${renderRoleSection(b)}
         ${renderBrandSection(b)}
         ${renderCardBehaviorSection(b)}
       </div>
     </article>`;
+  }
+
+  // Team-level role editor (one role per bot, cross-chat). This is the
+  // canonical place to EDIT the team role — the Team page only shows it
+  // read-only. The role isn't part of the /api/bots payload, so it's fetched
+  // once per bot via GET /api/team/local-bots/{app}/role and cached onto the
+  // bot snapshot (b.teamRole) — the page re-renders on every search keystroke,
+  // so caching avoids a fetch-per-keystroke storm. undefined = not loaded yet
+  // (render disabled + lazy-load); string = loaded (render it directly).
+  function renderRoleSection(b: any): string {
+    const loaded = typeof b.teamRole === 'string';
+    return `<section class="bd-section">
+      <h3 class="bd-section-title">${t('botDefaults.sectionRole')}</h3>
+      <p class="bd-section-note">${t('botDefaults.roleHelp')}</p>
+      <textarea data-input="teamRole" rows="6"
+        placeholder="${escapeHtml(t('botDefaults.rolePlaceholder'))}"
+        style="width:100%;box-sizing:border-box;font:13px/1.5 ui-monospace,Menlo,monospace;padding:10px"${loaded ? '' : ' disabled'}>${loaded ? escapeHtml(b.teamRole) : ''}</textarea>
+      <div class="actions">
+        <button type="button" data-action="save-role">${t('botDefaults.roleSave')}</button>
+        <button type="button" data-action="delete-role">${t('botDefaults.roleDelete')}</button>
+        <span class="oncall-status" data-role-status></span>
+      </div>
+    </section>`;
   }
 
   // brandLabel is null when unset (→ default botmux), '' when off, else custom.
@@ -373,6 +397,80 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
       if (privateCardCb) {
         privateCardCb.addEventListener('change', () => {
           putCardPref({ privateCard: privateCardCb.checked }, privateCardCb);
+        });
+      }
+
+      // ── Team role (one role per bot, cross-chat) ──────────────────────────
+      const roleTextarea = card.querySelector<HTMLTextAreaElement>('textarea[data-input=teamRole]');
+      const roleSaveBtn = card.querySelector<HTMLButtonElement>('button[data-action=save-role]');
+      const roleDeleteBtn = card.querySelector<HTMLButtonElement>('button[data-action=delete-role]');
+      const roleStatusEl = card.querySelector<HTMLSpanElement>('[data-role-status]');
+
+      if (roleTextarea && roleSaveBtn && roleDeleteBtn && roleStatusEl) {
+        const roleUrl = `/api/team/local-bots/${encodeURIComponent(appId)}/role`;
+        const cached = cache.bots.find((bb: any) => bb.larkAppId === appId);
+
+        // Lazily load the role ONCE per bot (textarea starts disabled so a
+        // slow/failed fetch can't be mistaken for an empty role). On success we
+        // stash it onto the snapshot (b.teamRole) so later re-renders — one per
+        // search keystroke — render from cache instead of re-fetching.
+        if (cached && typeof cached.teamRole !== 'string') {
+          (async () => {
+            try {
+              const r = await fetch(roleUrl);
+              const body = await r.json().catch(() => ({}));
+              if (r.ok && body.ok) {
+                cached.teamRole = body.role ?? '';
+                roleTextarea.value = cached.teamRole;
+                roleTextarea.disabled = false;
+              } else {
+                roleStatusEl.textContent = `✗ ${t('botDefaults.roleLoadErr')}: ${body.error ?? r.status}`;
+                roleStatusEl.classList.add('hint-warn-inline');
+              }
+            } catch (e: any) {
+              roleStatusEl.textContent = `✗ ${t('botDefaults.roleLoadErr')}: ${e?.message ?? e}`;
+              roleStatusEl.classList.add('hint-warn-inline');
+            }
+          })();
+        }
+
+        // PUT the role ('' = delete on the server). `deleted` picks the success
+        // toast; both buttons share this path. Server trims + deletes on empty,
+        // so we mirror the stored value into the cache for consistent re-renders.
+        async function putRole(role: string, btn: HTMLButtonElement, deleted: boolean) {
+          if (!roleStatusEl) return;
+          roleStatusEl.textContent = '';
+          roleStatusEl.className = 'oncall-status';
+          roleSaveBtn!.disabled = true;
+          roleDeleteBtn!.disabled = true;
+          try {
+            const r = await fetch(roleUrl, {
+              method: 'PUT',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ role }),
+            });
+            const body = await r.json().catch(() => ({}));
+            if (r.ok && body.ok) {
+              if (cached) cached.teamRole = role.trim();
+              roleStatusEl.textContent = `✓ ${deleted ? t('botDefaults.roleDeleted') : t('botDefaults.roleSaved')}`;
+              roleStatusEl.classList.add('hint-ok');
+            } else {
+              roleStatusEl.textContent = `✗ ${body.error ?? r.status}`;
+              roleStatusEl.classList.add('hint-warn-inline');
+            }
+          } catch (e: any) {
+            roleStatusEl.textContent = `✗ ${e?.message ?? e}`;
+            roleStatusEl.classList.add('hint-warn-inline');
+          } finally {
+            roleSaveBtn!.disabled = false;
+            roleDeleteBtn!.disabled = false;
+          }
+        }
+
+        roleSaveBtn.addEventListener('click', () => putRole(roleTextarea.value, roleSaveBtn, false));
+        roleDeleteBtn.addEventListener('click', () => {
+          roleTextarea.value = '';
+          putRole('', roleDeleteBtn, true);
         });
       }
     });

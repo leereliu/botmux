@@ -84,10 +84,10 @@ ${subNav('home')}
 <div id="tf-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);align-items:center;justify-content:center;z-index:50">
   <div style="background:var(--card,#fff);color:var(--text,#1f2329);border-radius:10px;padding:18px 20px;width:min(560px,92vw)">
     <h2 id="tf-modal-title" style="margin-top:0">团队角色</h2>
-    <p class="muted" style="font-size:13px">团队级角色（该机器人跨群的默认人设）。留空保存即删除。仅本部署的机器人可编辑。</p>
-    <textarea id="tf-modal-text" style="width:100%;min-height:200px;font:13px/1.5 ui-monospace,Menlo,monospace;padding:10px;box-sizing:border-box"></textarea>
+    <p class="muted" style="font-size:13px">团队级角色（该机器人跨群的默认人设），此处只读。如需修改，请到「Bot 配置」页。</p>
+    <textarea id="tf-modal-text" readonly style="width:100%;min-height:200px;font:13px/1.5 ui-monospace,Menlo,monospace;padding:10px;box-sizing:border-box"></textarea>
     <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:12px">
-      <button id="tf-modal-cancel">取消</button><button id="tf-modal-save" class="primary">保存</button>
+      <button id="tf-modal-cancel">关闭</button>
     </div>
   </div>
 </div>
@@ -128,9 +128,13 @@ function renderTeamBody(t: Team, filtered: RosterBot[]): string {
       const capCell = mine
         ? `<input class="tf-cap" data-app="${app}" value="${escapeHtml(b.capability || '')}" placeholder="能力标签…" style="width:92%;padding:3px 6px">`
         : (b.capability ? escapeHtml(b.capability) : '<span class="muted">—</span>');
-      const roleCell = mine
-        ? `<button class="tf-role" data-app="${app}" data-name="${escapeHtml(b.name)}">${b.hasTeamRole ? '已设·改' : '设置'}</button>`
-        : (b.hasTeamRole ? '有角色' : '<span class="muted">—</span>');
+      // Role is edited on the「Bot 配置」page now; here we only offer a
+      // read-only 查看 entry for this deployment's own bots that have one.
+      const roleCell = b.hasTeamRole
+        ? (mine
+          ? `<button class="tf-role" data-app="${app}" data-name="${escapeHtml(b.name)}">查看</button>`
+          : '有角色')
+        : '<span class="muted">—</span>';
       h += `<tr style="${dim}"><td style="padding:4px 8px"><input type="checkbox" class="tf-pick" data-tk="${escapeHtml(t.key)}" data-app="${app}"${ck}></td>`
         + `<td style="padding:4px 8px">${escapeHtml(b.name)}</td><td style="padding:4px 8px" class="muted">${escapeHtml(b.cliId)}</td>`
         + `<td style="padding:4px 8px">${capCell}</td><td style="padding:4px 8px">${roleCell}</td></tr>`;
@@ -302,12 +306,6 @@ export function renderTeamFederationPage(root: HTMLElement): void {
   pickedByTeam.clear(); gnameByTeam.clear(); expandedTeams.clear(); expandedDeps.clear();
   ['tf-search', 'tf-cli', 'tf-fcap', 'tf-frole'].forEach(id => { const el = $(id); el.oninput = renderTeams; el.onchange = renderTeams; });
   $('tf-modal-cancel').onclick = () => { $('tf-modal').style.display = 'none'; };
-  $('tf-modal-save').onclick = async () => {
-    const app = $('tf-modal').dataset.app!;
-    await jput('/api/team/local-bots/' + encodeURIComponent(app) + '/role', { role: ($('tf-modal-text') as HTMLTextAreaElement).value });
-    $('tf-modal').style.display = 'none';
-    loadLocal();
-  };
   wireBind();
   void loadLocal();
   void loadRemote();
