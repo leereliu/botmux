@@ -1,10 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-// Capture every `zellij` invocation the observe backend makes.
+// Capture every `zellij` invocation the observe backend makes. dump-screen
+// returns bare-`\n` content (as real zellij does) so we can assert normalisation.
 const calls: string[][] = [];
 vi.mock('node:child_process', () => ({
   execFileSync: (bin: string, args: string[]) => {
     calls.push([bin, ...args]);
+    if (args.includes('dump-screen')) return 'line one\nline two\nline three\n';
     return '';
   },
 }));
@@ -56,5 +58,12 @@ describe('ZellijObserveBackend input encoding', () => {
   it('resize is a no-op (never issues a zellij command — non-invasive)', () => {
     be.resize(200, 50);
     expect(calls).toHaveLength(0);
+  });
+
+  it('normalises dump-screen bare \\n to \\r\\n (else xterm staircases lines)', () => {
+    // zellij emits "line one\nline two\n…"; the xterm needs \r\n or each line
+    // continues from the previous end column (the misalignment 申晗 hit).
+    expect(be.captureViewport()).toBe('line one\r\nline two\r\nline three\r\n');
+    expect(be.captureCurrentScreen()).toBe('line one\r\nline two\r\nline three\r\n');
   });
 });

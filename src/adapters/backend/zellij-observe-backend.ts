@@ -1,6 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import type { ObserveBackend, SpawnOpts } from './types.js';
 import { tmuxKeyToBytes } from './zellij-backend.js';
+import { normaliseCaptureLineEndings } from './tmux-pipe-backend.js';
 import { zellijEnv } from '../../setup/ensure-zellij.js';
 import { logger } from '../../utils/logger.js';
 
@@ -189,7 +190,11 @@ export class ZellijObserveBackend implements ObserveBackend {
   private dumpScreen(full: boolean): string {
     const args = ['dump-screen', '--pane-id', this.paneId, '--ansi'];
     if (full) args.push('--full');
-    return this.action(args) ?? '';
+    // zellij dump-screen separates rows with bare `\n` (no `\r`). Fed to an
+    // xterm as-is, each line continues from the previous line's end column
+    // instead of returning to column 0 → the staircase/right-drift garble.
+    // Same fix tmux's capture path uses (normaliseCaptureLineEndings).
+    return normaliseCaptureLineEndings(this.action(args) ?? '');
   }
 
   private listPane(): any | null {
