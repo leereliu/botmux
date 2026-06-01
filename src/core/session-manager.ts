@@ -15,6 +15,7 @@ import { forkWorker, forkAdoptWorker, killStalePids, getCurrentCliVersion, resto
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { buildBotmuxShellHints } from '../adapters/cli/shared-hints.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
+import { ZellijBackend } from '../adapters/backend/zellij-backend.js';
 import { getBot, getAllBots } from '../bot-registry.js';
 import type { CliId } from '../adapters/cli/types.js';
 import { validateAdoptTarget } from './session-discovery.js';
@@ -540,7 +541,7 @@ export function shouldAutoForkOnRestore(
   backendType: 'pty' | 'tmux' | 'zellij',
   quietRestart: boolean,
 ): boolean {
-  return backendType === 'tmux' && !quietRestart;
+  return (backendType === 'tmux' || backendType === 'zellij') && !quietRestart;
 }
 
 export async function restoreActiveSessions(activeSessions: Map<string, DaemonSession>): Promise<void> {
@@ -660,29 +661,39 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
   // Skipped under quiet-restart (dev) — sessions resume lazily on the next
   // message instead of re-pushing their cards on every restart.
   if (shouldAutoForkOnRestore(config.daemon.backendType, config.daemon.quietRestart)) {
-    for (const [, ds] of activeSessions) {
-      const tmuxName = TmuxBackend.sessionName(ds.session.sessionId);
-      if (!TmuxBackend.hasSession(tmuxName)) continue;
+    // Both persistent backends expose the same static surface; pick by the
+    // daemon's backend so zellij sessions also eager-reattach on restart.
+    const isZellij = config.daemon.backendType === 'zellij';
+    const sessionNameFor = (sid: string) =>
+      isZellij ? ZellijBackend.sessionName(sid) : TmuxBackend.sessionName(sid);
+    const hasSession = (n: string) =>
+      isZellij ? ZellijBackend.hasSession(n) : TmuxBackend.hasSession(n);
+    const killSession = (n: string) =>
+      isZellij ? ZellijBackend.killSession(n) : TmuxBackend.killSession(n);
+    const kind = isZellij ? 'zellij' : 'tmux';
 
-      // Guard against re-attaching to a tmux session that was started with a
-      // different CLI than the bot is currently configured for. tmux's
-      // attach-session ignores the bin/args we hand to backend.spawn(), so
-      // without this check, changing a bot's cliId in bots.json would silently
-      // resurrect the OLD CLI on restart. Compare persisted session.cliId
-      // (stamped at fork time in worker-pool.forkWorker) against the bot's
-      // current config; mismatch ⇒ kill the stale tmux, let the next message
-      // trigger a fresh spawn.
+    for (const [, ds] of activeSessions) {
+      const sessName = sessionNameFor(ds.session.sessionId);
+      if (!hasSession(sessName)) continue;
+
+      // Guard against re-attaching to a session started with a different CLI
+      // than the bot is currently configured for. attach ignores the bin/args
+      // we hand to backend.spawn(), so without this check, changing a bot's
+      // cliId in bots.json would silently resurrect the OLD CLI on restart.
+      // Compare persisted session.cliId (stamped at fork time) against the
+      // bot's current config; mismatch ⇒ kill the stale session, let the next
+      // message trigger a fresh spawn.
       const tag = ds.session.sessionId.substring(0, 8);
       const sessionCliId = ds.session.cliId;
       let botCliId: CliId | undefined;
       try { botCliId = getBot(ds.larkAppId).config.cliId; } catch { /* bot deregistered */ }
       if (sessionCliId && botCliId && sessionCliId !== botCliId) {
-        logger.warn(`[${tag}] CLI mismatch (session=${sessionCliId}, bot=${botCliId}), killing stale tmux ${tmuxName}`);
-        TmuxBackend.killSession(tmuxName);
+        logger.warn(`[${tag}] CLI mismatch (session=${sessionCliId}, bot=${botCliId}), killing stale ${kind} ${sessName}`);
+        killSession(sessName);
         continue;
       }
 
-      logger.info(`[${tag}] Tmux session alive, auto-forking worker to re-attach`);
+      logger.info(`[${tag}] ${kind} session alive, auto-forking worker to re-attach`);
       forkWorker(ds, '', true);
     }
   }

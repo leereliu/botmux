@@ -102,6 +102,23 @@ describe('parseDumpLayoutPanes', () => {
 }`;
     expect(parseDumpLayoutPanes(kdl)[0]!.cwd).toBe('/srv/work');
   });
+
+  it('unescapes KDL-escaped quotes/backslashes in attrs and args', () => {
+    // zellij serialises a value `say "hi"` as `"say \"hi\""` and `back\slash`
+    // as `"back\\slash"`. The parser must reverse both.
+    const kdl = `layout {
+    cwd "/h"
+    tab {
+        pane command="my cli" cwd="/p/a b" {
+            args "--msg" "say \\"hi\\"" "back\\\\slash"
+        }
+    }
+}`;
+    const p = parseDumpLayoutPanes(kdl)[0]!;
+    expect(p.command).toBe('my cli');
+    expect(p.cwd).toBe('/p/a b');
+    expect(p.args).toEqual(['--msg', 'say "hi"', 'back\\slash']);
+  });
 });
 
 describe('parseListPanesJson', () => {

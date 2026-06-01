@@ -44,7 +44,7 @@ async function main() {
   banner('4) kill (detach) — session must SURVIVE');
   be.kill();
   await sleep(800);
-  console.log('exited after kill:', exited, '(expect false — detach only)');
+  console.log('exited after kill:', exited, '(expect false — intentional detach suppresses onExit)');
   console.log('hasSession after kill:', ZellijBackend.hasSession(name), '(expect true)');
 
   banner('5) reattach with a NEW backend (simulates daemon restart)');

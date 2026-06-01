@@ -2987,6 +2987,41 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     (backend as TmuxBackend | PtyBackend | ZellijBackend).cliCwd = cfg.workingDir;
   }
 
+  // Async pid fallback: tmux/pty resolve the CLI pid synchronously above, but
+  // zellij's CLI subprocess starts AFTER spawn() returns (the zellij server
+  // forks the pane asynchronously), so getChildPid() is null right now. Without
+  // the marker, an in-CLI `botmux send` walks ancestor pids, finds no match,
+  // and reports "无法推断 session-id". Retry briefly (non-blocking — a sync wait
+  // would lose zellij's initial render since node-pty doesn't buffer pre-listener
+  // output) until the pid appears, then write the marker + wire claude-code pid.
+  if (!cliPid) {
+    let attempts = 0;
+    const resolveCliPidLate = () => {
+      if (!backend) return;
+      const pid = backend.getChildPid?.();
+      if (pid) {
+        if (process.env.SESSION_DATA_DIR && !cliPidMarker) {
+          try {
+            const markersDir = join(process.env.SESSION_DATA_DIR, '.botmux-cli-pids');
+            mkdirSync(markersDir, { recursive: true });
+            cliPidMarker = join(markersDir, String(pid));
+            writeFileSync(cliPidMarker, cfg.sessionId);
+            log(`CLI PID marker written (async): ${pid}`);
+          } catch (err: any) {
+            log(`Failed to write CLI PID marker (async): ${err.message}`);
+          }
+        }
+        if (cfg.cliId === 'claude-code') {
+          (backend as TmuxBackend | PtyBackend | ZellijBackend).cliPid = pid;
+          (backend as TmuxBackend | PtyBackend | ZellijBackend).cliCwd = cfg.workingDir;
+        }
+        return;
+      }
+      if (++attempts < 25) setTimeout(resolveCliPidLate, 120); // ~3s budget
+    };
+    setTimeout(resolveCliPidLate, 120);
+  }
+
   // On tmux re-attach, keep awaitingFirstPrompt = true so screen updates are
   // suppressed until the idle detector fires markNewTurn() — this prevents the
   // full tmux scrollback history from leaking into the streaming card.

@@ -39,6 +39,14 @@ export class ZellijBackend implements SessionBackend {
   private reattaching = false;
   private configPath: string | null = null;
   private tmpConfigDir: string | null = null;
+  /** Set by kill()/destroySession() so the pty-client exit they cause (an
+   *  intentional detach/teardown — the zellij session survives) is NOT
+   *  reported as a CLI exit. A real CLI exit leaves this false. */
+  private intentionalExit = false;
+  /** Cached CLI pid. The CLI subprocess starts asynchronously after spawn(),
+   *  so the first getChildPid() may be null; once resolved it's stable for the
+   *  session lifetime (single CLI pane → pane exit ends the session). */
+  private resolvedCliPid: number | null = null;
   /** Explicit pane target for adopt mode (e.g. "terminal_2"). When null,
    *  zellij `action` commands address the focused pane — correct for managed
    *  mode where the single CLI pane is always focused. */
@@ -193,16 +201,28 @@ export class ZellijBackend implements SessionBackend {
   /** Must be called AFTER spawn(). */
   onExit(cb: (code: number | null, signal: string | null) => void): void {
     this.process?.onExit(({ exitCode, signal }) => {
+      // Suppress the pty-client exit caused by our own kill()/destroySession()
+      // (intentional detach/teardown — the zellij session survives, so a
+      // claude_exit here would falsely tear the worker down on restart). A real
+      // CLI exit (pane closes → single-pane session ends) leaves intentionalExit
+      // false and is forwarded. Mirrors TmuxPipeBackend's intentional-detach
+      // semantics (pty-under TmuxBackend lacked this — the gap Codex flagged).
+      if (this.intentionalExit) return;
       cb(exitCode, signal !== undefined ? String(signal) : null);
     });
   }
 
+  /** CLI pid. May be null immediately after spawn() (the CLI subprocess starts
+   *  asynchronously); the worker retries. Cached once resolved. */
   getChildPid(): number | null {
-    return findPaneCliPid(this.sessionName, '') ?? null;
+    if (this.resolvedCliPid !== null) return this.resolvedCliPid;
+    this.resolvedCliPid = findPaneCliPid(this.sessionName, '');
+    return this.resolvedCliPid;
   }
 
   /** Detach only — kills the pty client, leaves the zellij session running. */
   kill(): void {
+    this.intentionalExit = true;
     if (this.process) {
       try { this.process.kill(); } catch { /* already dead */ }
       this.process = null;

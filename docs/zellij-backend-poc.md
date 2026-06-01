@@ -42,18 +42,28 @@ zellij 生产命脉对照 tmux：botmux 当前生产用 `TmuxPipeBackend`，靠 
 - `test/zellij-backend-helpers.test.ts`：键位映射、KDL 转义、layout 生成、版本门
 - 17 单测全绿；`tsc --noEmit` 全仓干净
 
+## Codex review 已修的 3 个 blocker
+
+1. **daemon 退出删 zellij session（破坏重启 reattach）** → `daemon.ts` 把 zellij 纳入 persistent backend：shutdown 走 `w.kill('SIGTERM')`（worker SIGTERM→`backend.kill()` 仅 detach），不再走 `killWorker`→close→`destroySession`→`delete-session`。`session-manager.ts` 的 restore 也泛化为 zellij eager-reattach + CLI mismatch guard。
+2. **CLI pid marker 竞态**（zellij CLI 子进程异步起，`getChildPid()` spawn 后立刻为 null，~120ms 才有）→ worker 加非阻塞异步重试（120ms×25≈3s 预算）写 marker + 接 claude pid。**不能同步阻塞**：实测 node-pty 不缓存 listener 注册前的输出，sync 等待会丢 zellij 初屏。
+3. **`kill()` 触发 onExit 误报 CLI 退出** → `ZellijBackend` 加 `intentionalExit` 标志，`kill()/destroySession()` 置位后抑制这一轮 pty-client exit 回调；真实 CLI 退出（pane 关→会话终）照常上报。对齐 `TmuxPipeBackend` 语义。harness 实测 `exited after kill: false`。
+
+外加：`botmux setup`/help 接受 zellij；补 KDL 转义解析 fixture。
+
 ## 接线状态
 
-- ✅ **托管模式**已全链路接进 worker：`BACKEND_TYPE=zellij` → selector 选 `ZellijBackend`，worker 当作非 tmux/pty 路径（截图走 headless renderer、web 终端走 relay），但内部持有持久 zellij 会话。
-- ⏳ **/adopt 守护进程流**未接：发现模块（基础件）已就绪+实测，但把它接进 `worker-pool` 的扫描/`adopt-route`/各 CLI 的 bridge watcher 是更大的一块，留作下一步。
-- ⏳ 未跑整 daemon 出真实 Lark 卡片：渲染路径与现有 pty 后端一致（已被生产验证），但端到端 Lark 卡片验证留作集成步。
+- ✅ **托管模式**全链路：`BACKEND_TYPE=zellij` → selector 选 `ZellijBackend`，worker 当非 tmux/pty 路径（截图走 headless renderer、web 终端走 relay），内部持有持久 zellij 会话。
+- ✅ **daemon 重启持久化**：shutdown detach + restore eager-reattach（含 mismatch guard），与 tmux 持平。
+- ⏳ **/adopt 守护进程流**未接：发现模块（基础件）已就绪+实测，但接进 `worker-pool` 扫描/`adopt-route`/各 CLI bridge watcher 是更大一块，留作下一步。
+- ⏳ 未跑整 daemon 出真实 Lark 卡片：渲染路径与现有 pty 后端一致（已被生产验证），端到端验证留作集成步。
 
-## 已知 caveat（供 review）
+## 已知 caveat / /adopt 接线前待办（供 review）
 
-- pty-under 模型里 `kill()` 会触发 `onExit`（杀的是 attach 客户端 pty）——与旧 `TmuxBackend` 行为一致，但与生产 `TmuxPipeBackend`（pipe 不触发）不同。仅在 worker 主动 teardown 时调，影响面待 review 确认。
-- pane_id↔CLI 的 join 按文档顺序，常规单/少 pane 稳；极端多 tab/浮动布局需叠加几何/proc 交叉校验。
-- 每会话一个 zellij server 进程（tmux 是单 server 托管全部）→ 几十会话时资源开销高于 tmux。
-- 一个 CLI 一会话单 pane 的前提下 `getChildPid` 取「server 的唯一非 zellij 子进程」；多 pane 需细化。
+- discovery 的 order-join 按文档顺序，常规单/少 pane 稳；极端多 tab/浮动/乱序布局需叠加 tab/geometry/title/terminal_command/cwd/proc 多信号校验，歧义时应拒绝 adopt（留给 /adopt 阶段）。
+- dump-layout 用 regex/KDL 子集解析，已加转义 fixture；生产前可换正式 KDL parser。
+- `ZellijBackend` 的 `paneId` 构造参数当前仅 managed 单 pane 用焦点语义；/adopt 需走 `zellij action --pane-id` 定向输入 + 定向观测（subscribe/dump-screen 快照路径，需适配 renderer/idle），不能靠焦点。
+- 每会话一个 zellij server 进程（tmux 单 server 托管全部）→ 几十会话资源开销高于 tmux。
+- `getChildPid` 取「server 唯一非 zellij 子进程」，单 pane 成立；多 pane 需 pane→pid 可靠映射。
 
 ## 手动验证
 

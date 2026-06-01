@@ -3077,9 +3077,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         const backendType = ds.larkAppId
           ? (getBot(ds.larkAppId).config.backendType ?? config.daemon.backendType)
           : config.daemon.backendType;
-        if (backendType === 'tmux') {
-          // Tmux mode: just kill the worker process — tmux session survives for re-attach.
-          // Worker's SIGTERM handler calls backend.kill() which only detaches.
+        if (backendType === 'tmux' || backendType === 'zellij') {
+          // Persistent backends (tmux / zellij): just kill the worker process —
+          // the multiplexer session survives for re-attach. The worker's SIGTERM
+          // handler calls backend.kill(), which only DETACHES. Going through
+          // killWorker() instead would send {type:'close'} → destroySession() →
+          // `zellij delete-session -f`, permanently erasing the session and
+          // breaking daemon-restart reattach (the blocker Codex flagged).
           try { w.kill('SIGTERM'); } catch { /* ignore */ }
           ds.worker = null;
           ds.workerPort = null;

@@ -800,8 +800,8 @@ async function promptEditBotConfig(
   }
 
   printInputHelp('会话后端 backendType', [
-    '可选。pty 更轻量；tmux 支持 adopt 和 Web Terminal 附着。',
-    '留空保留当前值；输入 - 回到自动检测；只接受 pty 或 tmux。',
+    '可选。pty 更轻量；tmux 支持 adopt 和 Web Terminal 附着；zellij 为实验后端（pty-under-zellij，需 zellij >= 0.44）。',
+    '留空保留当前值；输入 - 回到自动检测；接受 pty / tmux / zellij。',
   ]);
   input.backendType = await ask(rl, `会话后端 backendType [${formatOptionalValue(bot.backendType)}]: `);
 
