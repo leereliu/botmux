@@ -35,13 +35,22 @@ function detectDefaultBackend(): 'pty' | 'tmux' {
   return probeTmuxFunctional().ok ? 'tmux' : 'pty';
 }
 
+// Computed once: the packaged fallback data dir. The effective dir is read
+// lazily (getter below) so that a SESSION_DATA_DIR set *after* this module is
+// first imported — e.g. cli.ts subcommands doing
+// `process.env.SESSION_DATA_DIR ??= resolveDataDir()` — is still honored. A
+// static value would freeze the packaged default at import time and make those
+// readers (resolveTeamRoleFile / getBotCapability / …) silently look in the
+// wrong directory. Mirrors the web/dashboard externalHost getters below.
+const packagedDataDir = new URL('../data', import.meta.url).pathname;
+
 export const config = {
   lark: {
     appId: process.env.LARK_APP_ID ?? '',
     appSecret: process.env.LARK_APP_SECRET ?? '',
   },
   session: {
-    dataDir: process.env.SESSION_DATA_DIR ?? new URL('../data', import.meta.url).pathname,
+    get dataDir() { return process.env.SESSION_DATA_DIR ?? packagedDataDir; },
   },
   send: {
     /** @ hard-gate: every model-initiated `botmux send` reply must explicitly
