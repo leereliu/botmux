@@ -999,11 +999,11 @@ botmux restart        # 生效
 
 ## 系统依赖
 
-合成产物要编码成飞书语音气泡用的 opus 格式，依赖系统的 **opus-tools**：
+合成产物要编码成飞书语音气泡用的 opus 格式，依赖系统的 **opus-tools**（提供 \`opusenc\`）。**跑 \`botmux voice\` 配置时会自动检测，没装会询问并帮你装好**（沿用和 tmux 一致的包管理器 + sudo 逻辑）。也可手动安装：
 
 \`\`\`bash
 # Debian / Ubuntu
-apt-get install -y opus-tools
+sudo apt-get install -y opus-tools
 # macOS
 brew install opus-tools
 \`\`\`
