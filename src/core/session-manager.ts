@@ -728,7 +728,12 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
     if (!shouldAutoForkOnRestore(backendType, config.daemon.quietRestart)) continue;
 
     const backendName = persistentSessionName(backendType, ds.session.sessionId);
-    if (!persistentSessionExists(backendType, backendName)) continue;
+    if (!persistentSessionExists(backendType, backendName)) {
+      const tag = ds.session.sessionId.substring(0, 8);
+      logger.warn(`[${tag}] ${backendType} backing session "${backendName}" is gone — closing zombie active session`);
+      await closeSession(ds.session.sessionId);
+      continue;
+    }
 
     // Guard against re-attaching to a persistent session that was started with a
     // different CLI than the bot is currently configured for. Persistent backend
