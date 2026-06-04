@@ -43,6 +43,7 @@ const mockListChatBotMembers = vi.fn(async () => [] as Array<{ openId: string; n
 const mockGetChatMode = vi.fn(async () => 'topic' as 'group' | 'topic' | 'p2p');
 const mockGetChatInfo = vi.fn(async () => ({ userCount: 1, botCount: 1 }));
 const mockReplyMessage = vi.fn(async () => 'msg-id');
+const mockUpdateMessage = vi.fn(async () => true);
 // 默认所有 open_id 都判为「非真人」（bot）→ 保持既有用例「全部登记」的预期；
 // 需要模拟真人的用例用 mockResolvedValueOnce(true)。
 const mockIsHumanOpenId = vi.fn(async () => false);
@@ -51,6 +52,7 @@ vi.mock('../src/im/lark/client.js', () => ({
   getChatMode: (...args: any[]) => mockGetChatMode(...args),
   listChatBotMembers: (...args: any[]) => mockListChatBotMembers(...args),
   replyMessage: (...args: any[]) => mockReplyMessage(...args),
+  updateMessage: (...args: any[]) => mockUpdateMessage(...args),
   isHumanOpenId: (...args: any[]) => mockIsHumanOpenId(...args),
 }));
 
@@ -1842,6 +1844,72 @@ describe('im.message.receive_v1 — /introduce command', () => {
     expect(mockRecordObservedBots).toHaveBeenCalledTimes(1);
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+});
+
+describe('card.action.trigger — ack-safe slow handlers', () => {
+  let handlers: ReturnType<typeof makeHandlers>;
+
+  beforeEach(() => {
+    capturedHandlers = {};
+    __resetAnchorQueues();
+    __resetEventClaimsForTest();
+    mockUpdateMessage.mockClear();
+    setupBotState();
+    handlers = makeHandlers();
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+  });
+
+  it('preserves immediate card action responses when the handler is fast', async () => {
+    handlers.handleCardAction.mockResolvedValue({ type: 'updated-card' });
+
+    const result = await capturedHandlers['card.action.trigger']({
+      action: { value: { action: 'toggle_stream', root_id: 'root-fast' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_fast_card' },
+    });
+
+    expect(result).toEqual({ card: { type: 'raw', data: { type: 'updated-card' } } });
+    expect(mockUpdateMessage).not.toHaveBeenCalled();
+  });
+
+  it('returns a toast before a slow handler settles, then patches the card in background', async () => {
+    let release!: () => void;
+    const slow = new Promise(resolve => { release = () => resolve({ type: 'late-card' }); });
+    handlers.handleCardAction.mockReturnValue(slow as any);
+
+    vi.useFakeTimers();
+    const call = capturedHandlers['card.action.trigger']({
+      action: { value: { action: 'toggle_stream', root_id: 'root-slow' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_slow_card' },
+    });
+    await vi.advanceTimersByTimeAsync(2500);
+    await expect(call).resolves.toEqual({ toast: { type: 'info', content: '操作已收到，后台处理中' } });
+
+    release();
+    await vi.runAllTimersAsync();
+    vi.useRealTimers();
+
+    expect(mockUpdateMessage).toHaveBeenCalledWith(MY_APP_ID, 'om_slow_card', JSON.stringify({ type: 'late-card' }));
+  });
+
+  it('dedupes a repeated card action while the first copy is still running', async () => {
+    let release!: () => void;
+    handlers.handleCardAction.mockReturnValue(new Promise(resolve => { release = () => resolve(undefined); }) as any);
+    const event = {
+      action: { value: { action: 'restart', root_id: 'root-dup' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_dup_card' },
+    };
+
+    const first = capturedHandlers['card.action.trigger'](event);
+    const second = await capturedHandlers['card.action.trigger']({ ...event });
+
+    expect(second).toEqual({ toast: { type: 'info', content: '操作正在处理中，请稍候' } });
+    expect(handlers.handleCardAction).toHaveBeenCalledTimes(1);
+    release();
+    await first;
   });
 });
 

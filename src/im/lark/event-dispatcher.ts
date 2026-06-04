@@ -8,7 +8,7 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { getBot, getAllBots, findOncallChat, getOwnerOpenId, type BotState } from '../../bot-registry.js';
 import { config } from '../../config.js';
-import { getChatInfo, getChatMode, listChatBotMembers, replyMessage, sendUserMessage, isHumanOpenId } from './client.js';
+import { getChatInfo, getChatMode, listChatBotMembers, replyMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
 import { logger } from '../../utils/logger.js';
 import { serializeByAnchor } from '../../utils/anchor-serializer.js';
 import { parseForceTopicInvocation } from '../../core/command-handler.js';
@@ -313,9 +313,92 @@ function eventIdForKey(data: any): string | undefined {
   return data?.event_id ?? data?.uuid ?? data?.header?.event_id ?? data?.event?.event_id;
 }
 
+const CARD_ACTION_ACK_TIMEOUT_MS = 2500;
+const cardActionInFlight = new Set<string>();
+
+function cardActionMessageId(data: any): string | undefined {
+  return data?.context?.open_message_id ?? data?.open_message_id;
+}
+
+function cardActionKey(larkAppId: string, data: any): string {
+  const eventId = eventIdForKey(data);
+  if (eventId) return `card.action.trigger:${larkAppId}:${eventId}`;
+  const action = data?.action;
+  const value = action?.value ?? {};
+  return `card.action.trigger:${larkAppId}:${JSON.stringify({
+    messageId: cardActionMessageId(data),
+    operator: data?.operator?.open_id,
+    action: value?.action ?? action?.option ?? action?.tag,
+    rootId: value?.root_id,
+    sessionId: value?.session_id,
+    nonce: value?.card_nonce ?? value?.nonce,
+    option: action?.option,
+    key: value?.key,
+  })}`;
+}
+
+function shapeCardActionResult(result: any): any {
+  // The handler may return:
+  //   - an already-shaped Lark response ({toast} and/or {card}) -> pass through;
+  //   - a raw card body (e.g. toggle_stream) -> wrap as an in-place card patch.
+  if (result && (result.toast || result.card)) return result;
+  if (result) return { card: { type: 'raw', data: result } };
+  return undefined;
+}
+
+function serializeRawCardForPatch(cardData: any): string | undefined {
+  if (cardData === undefined || cardData === null) return undefined;
+  return typeof cardData === 'string' ? cardData : JSON.stringify(cardData);
+}
+
+async function patchTimedOutCardActionResult(larkAppId: string, data: any, shapedResult: any): Promise<void> {
+  const messageId = cardActionMessageId(data);
+  if (!messageId || !shapedResult?.card) return;
+  const card = shapedResult.card;
+  const raw = card.type === 'raw' ? card.data : card;
+  const body = serializeRawCardForPatch(raw);
+  if (!body) return;
+  await updateMessage(larkAppId, messageId, body);
+}
+
+async function handleCardActionAckSafe(data: any, larkAppId: string, handlers: EventHandlers): Promise<any> {
+  const key = cardActionKey(larkAppId, data);
+  if (cardActionInFlight.has(key)) {
+    logger.info(`[event-dedupe] duplicate card action ignored while in-flight: ${key}`);
+    return { toast: { type: 'info', content: '操作正在处理中，请稍候' } };
+  }
+
+  cardActionInFlight.add(key);
+  let timedOut = false;
+  const work = handlers.handleCardAction(data, larkAppId)
+    .then(shapeCardActionResult)
+    .catch(err => {
+      logger.error(`Error handling card action: ${err}`);
+      return undefined;
+    });
+
+  void work.then(result => {
+    if (!timedOut || !result) return;
+    return patchTimedOutCardActionResult(larkAppId, data, result)
+      .catch(err => logger.warn(`Failed to patch timed-out card action result: ${err}`));
+  }).finally(() => {
+    cardActionInFlight.delete(key);
+  });
+
+  const timeout = new Promise(resolve => setTimeout(resolve, CARD_ACTION_ACK_TIMEOUT_MS, Symbol.for('card-action-timeout')));
+  const result = await Promise.race([work, timeout]);
+  if (result === Symbol.for('card-action-timeout')) {
+    timedOut = true;
+    logger.warn(`[card-action] handler exceeded ${CARD_ACTION_ACK_TIMEOUT_MS}ms; ACKing first and continuing in background: ${key}`);
+    return { toast: { type: 'info', content: '操作已收到，后台处理中' } };
+  }
+  return result;
+}
+
 /** Test-only: clear callback dedupe claims between cases. */
 export function __resetEventClaimsForTest(): void {
   eventClaims.clear();
+  cardActionInFlight.clear();
 }
 
 export async function getGroupStats(larkAppId: string, chatId: string): Promise<{ userCount: number; botCount: number }> {
@@ -911,21 +994,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       }
       }, 'bot-added event');
     },
-    'card.action.trigger': async (data: any) => {
-      try {
-        const result = await handlers.handleCardAction(data, larkAppId);
-        // The handler may return:
-        //   - an already-shaped Lark response ({toast} and/or {card}) → pass through
-        //     so toasts (e.g. "仅 owner 可操作") and explicit card payloads render;
-        //   - a raw card body (e.g. toggle_stream) → wrap as an in-place card patch
-        //     so Lark updates the clicked card without waiting for an API PATCH.
-        if (result && (result.toast || result.card)) return result;
-        if (result) return { card: { type: 'raw', data: result } };
-      } catch (err) {
-        logger.error(`Error handling card action: ${err}`);
-      }
-      return undefined;
-    },
+    'card.action.trigger': (data: any) => handleCardActionAckSafe(data, larkAppId, handlers),
     'im.message.receive_v1': (data: any) => {
       const messageIdForKey = data?.message?.message_id;
       const eventKey = `im.message.receive_v1:${larkAppId}:${eventIdForKey(data) ?? messageIdForKey ?? JSON.stringify(data).slice(0, 200)}`;
