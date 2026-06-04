@@ -28,7 +28,7 @@ import {
   type PidFollowResult,
 } from './services/bridge-rotation-policy.js';
 import { CodexBridgeQueue } from './services/codex-bridge-queue.js';
-import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, splitCodexEventsByCutoff, extractLastCodexTurn } from './services/codex-transcript.js';
+import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, splitCodexEventsByCutoff, extractLastCodexTurn, type CodexBridgeEvent } from './services/codex-transcript.js';
 import { findTraexRolloutBySessionId, findTraexRolloutByPid } from './services/traex-transcript.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
 import { currentHermesStateOffset, drainHermesStateDb } from './services/hermes-transcript.js';
@@ -1440,6 +1440,41 @@ function structuredBridgeIngestPath(path: string, offset: number) {
   return drainCocoEvents(path, offset);
 }
 
+function structuredBridgeProbeEnabled(): boolean {
+  // Cursor is the only current structured bridge without per-event timestamps,
+  // so keep the high-cardinality attribution probe scoped there by default.
+  return structuredBridgeIsCursor();
+}
+
+function structuredBridgeEventPreview(events: CodexBridgeEvent[]): string {
+  return events.map(ev => {
+    const uuid = ev.uuid.length > 24 ? `...${ev.uuid.slice(-24)}` : ev.uuid;
+    return `${ev.kind}:${uuid}:${ev.text.replace(/\s+/g, ' ').slice(0, 60)}`;
+  }).join(' | ');
+}
+
+function structuredBridgeQueueSnapshot(): string {
+  const snap = codexBridgeQueue.debugSnapshot();
+  return JSON.stringify({
+    localTurnsEnabled: snap.localTurnsEnabled,
+    collectingTurnId: snap.collectingTurnId,
+    queued: snap.queued.map(t => ({
+      turnId: t.turnId.slice(0, 8),
+      started: t.started,
+      hasFinalText: t.hasFinalText,
+      isLocal: t.isLocal,
+      markTimeMs: t.markTimeMs,
+      fp: t.contentFingerprint,
+    })),
+    buffered: snap.buffered.map(ev => ({
+      kind: ev.kind,
+      uuid: ev.uuid.length > 18 ? `...${ev.uuid.slice(-18)}` : ev.uuid,
+      timestampMs: ev.timestampMs,
+      text: ev.textPreview.replace(/\s+/g, ' '),
+    })),
+  });
+}
+
 function codexBridgeStartTimer(): void {
   if (codexBridgeTimer) return;
   // Single 1s ticker that handles three jobs: late-attach (poll for the
@@ -1494,7 +1529,7 @@ function codexBridgeStartTimer(): void {
           if (path) {
             codexBridgePendingSessionId = undefined;
             codexAdoptPendingPid = undefined;
-            cursorBridgeAttach(path);
+            cursorBridgeAttach(path, cursorLateAttachMode(path));
           }
         }
         codexBridgeIngest();
@@ -1613,7 +1648,7 @@ function mtrBridgeIngest(): void {
   }
 }
 
-function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'fresh-empty' | 'split-live'): void {
+function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'baseline-existing-skip-tail' | 'fresh-empty' | 'split-live'): void {
   codexBridgeRolloutPath = rolloutPath;
   if (mode === 'fresh-empty') {
     // Brand-new session OR late-attach right after first submit. Either
@@ -1652,6 +1687,13 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'fre
     codexBridgePendingTail = '';
     codexBridgeBaselineDone = true;
     log(`Codex bridge split-live degraded to fresh (file missing): ${rolloutPath}`);
+  } else if (mode === 'baseline-existing-skip-tail' && existsSync(rolloutPath)) {
+    let size = 0;
+    try { size = statSync(rolloutPath).size; } catch { /* degrade below */ }
+    codexBridgeOffset = size;
+    codexBridgePendingTail = '';
+    codexBridgeBaselineDone = true;
+    log(`Codex bridge baselined: ${rolloutPath} (offset=${codexBridgeOffset}, skipTail=true)`);
   } else if (existsSync(rolloutPath)) {
     const cursor = baselineJsonlCursor(rolloutPath);
     codexBridgeOffset = cursor.newOffset;
@@ -1681,14 +1723,30 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'fre
   codexBridgeStartTimer();
 }
 
+type CursorAttachMode = 'baseline-existing' | 'fresh-empty';
+
+function cursorLateAttachMode(path: string): CursorAttachMode {
+  const start = codexAdoptStartMs;
+  if (start !== undefined) {
+    try {
+      const birthtimeMs = statSync(path).birthtimeMs;
+      // Cursor often creates the agent-transcript file lazily on the first
+      // post-adopt submit. In that case the first user line is live and must
+      // be ingested from byte 0 rather than swallowed as history.
+      if (Number.isFinite(birthtimeMs) && birthtimeMs >= start - 5_000) return 'fresh-empty';
+    } catch { /* fall back to history-safe baseline */ }
+  }
+  return 'baseline-existing';
+}
+
 /** Attach the Cursor adopt bridge. Cursor's JSONL has no per-event
- *  timestamp, so split-live's timestamp cutoff can't separate pre-adopt
- *  history from live turns. Instead we baseline by byte offset (history is
- *  behind the offset and never re-ingested) and surface the last completed
- *  turn as the "📜 /adopt 前最后一轮" preamble from a one-shot full drain
- *  before baselining past it. */
-function cursorBridgeAttach(path: string): void {
-  if (existsSync(path)) {
+ *  timestamp, so existing transcripts are baselined by byte offset. Cursor
+ *  restore intentionally skips any partial tail present at attach time: it is
+ *  old in-flight output and must not be attributed to the next Lark turn. If
+ *  the transcript is created after /adopt, attach fresh so the first
+ *  post-adopt Lark/user turn can still be attributed. */
+function cursorBridgeAttach(path: string, mode: CursorAttachMode = 'baseline-existing'): void {
+  if (mode === 'baseline-existing' && existsSync(path)) {
     try {
       const full = drainCursorTranscript(path, 0);
       maybeEmitCodexAdoptPreamble(full.events);
@@ -1696,7 +1754,7 @@ function cursorBridgeAttach(path: string): void {
       log(`Cursor bridge preamble drain failed: ${err.message}`);
     }
   }
-  codexBridgeAttach(path, 'baseline-existing');
+  codexBridgeAttach(path, mode === 'baseline-existing' ? 'baseline-existing-skip-tail' : mode);
 }
 
 /** Called from flushPending after writeInput first returns a cliSessionId.
@@ -1721,7 +1779,7 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
     const cursorPath = findCursorTranscriptByChatId(cliSessionId);
     if (cursorPath) {
       codexBridgePendingSessionId = undefined;
-      cursorBridgeAttach(cursorPath);
+      cursorBridgeAttach(cursorPath, cursorLateAttachMode(cursorPath));
     } else {
       codexBridgePendingSessionId = cliSessionId;
       codexBridgeStartTimer();
@@ -1750,11 +1808,16 @@ function codexBridgeIngest(): void {
     return;
   }
   if (!codexBridgeRolloutPath || !codexBridgeBaselineDone) return;
+  const oldOffset = codexBridgeOffset;
+  const before = structuredBridgeProbeEnabled() ? structuredBridgeQueueSnapshot() : '';
   const result = structuredBridgeIngestPath(codexBridgeRolloutPath, codexBridgeOffset);
   codexBridgeOffset = result.newOffset;
   codexBridgePendingTail = result.pendingTail;
   if (result.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
   codexBridgeQueue.ingest(result.events);
+  if (structuredBridgeProbeEnabled() && (result.events.length > 0 || oldOffset !== result.newOffset)) {
+    log(`Structured bridge probe ingest: offset=${oldOffset}->${result.newOffset}, events=${result.events.length}, tail=${result.pendingTail.length}, eventPreview="${structuredBridgeEventPreview(result.events)}", before=${before}, after=${structuredBridgeQueueSnapshot()}`);
+  }
   // Transcript-driven idle: an `assistant_final` event is the CLI declaring
   // end-of-turn, far more reliable than the screen-pattern heuristic
   // (CoCo's status bar varies by --yolo flag, version, theme; codex has
@@ -1772,7 +1835,13 @@ function codexBridgeIngest(): void {
 function codexBridgeMarkPendingTurn(messageText: string): boolean {
   if (!codexBridgeFallbackActive()) return false;
   const turnId = `codex-${randomBytes(8).toString('hex')}`;
+  if (structuredBridgeProbeEnabled()) {
+    log(`Structured bridge probe mark: turn=${turnId.slice(0, 8)}, preview="${messageText.replace(/\s+/g, ' ').slice(0, 80)}", before=${structuredBridgeQueueSnapshot()}`);
+  }
   codexBridgeQueue.mark(turnId, messageText);
+  if (structuredBridgeProbeEnabled()) {
+    log(`Structured bridge probe mark done: turn=${turnId.slice(0, 8)}, after=${structuredBridgeQueueSnapshot()}`);
+  }
   return true;
 }
 
@@ -1785,8 +1854,20 @@ function codexBridgeDrainAndMaybeEmit(): void {
 }
 
 function emitReadyCodexTurns(): void {
+  const probe = structuredBridgeProbeEnabled();
+  const before = probe ? structuredBridgeQueueSnapshot() : '';
   const ready = codexBridgeQueue.drainEmittable();
-  if (ready.length === 0) return;
+  if (ready.length === 0) {
+    if (probe && before !== structuredBridgeQueueSnapshot()) {
+      log(`Structured bridge probe drain: ready=0, before=${before}, after=${structuredBridgeQueueSnapshot()}`);
+    } else if (probe && before.includes('"queued":[{')) {
+      log(`Structured bridge probe drain: ready=0, state=${before}`);
+    }
+    return;
+  }
+  if (probe) {
+    log(`Structured bridge probe drain: ready=${ready.length}, readyTurns=${JSON.stringify(ready.map(t => ({ turnId: t.turnId.slice(0, 8), isLocal: t.isLocal === true, finalLen: t.finalText?.length ?? 0, markTimeMs: t.markTimeMs })))}, before=${before}, after=${structuredBridgeQueueSnapshot()}`);
+  }
   const adoptMode = lastInitConfig?.adoptMode === true;
   // Adopt mode: model is the user's external Codex, no botmux send to
   // gate against — every assistant turn (Lark-driven OR locally typed)
@@ -1827,9 +1908,15 @@ function emitReadyCodexTurns(): void {
         kind: 'local-turn',
         userText: fields.userText,
       });
+      if (probe) {
+        log(`Structured bridge probe send local final_output: turn=${turn.turnId.slice(0, 8)}, len=${fields.content.length}`);
+      }
       continue;
     }
     send({ type: 'final_output', content: turn.finalText, lastUuid: turn.turnId, turnId: turn.turnId });
+    if (probe) {
+      log(`Structured bridge probe send final_output: turn=${turn.turnId.slice(0, 8)}, len=${turn.finalText.length}`);
+    }
   }
 }
 
@@ -2957,7 +3044,11 @@ function setupAdoptTranscriptBridges(cfg: Extract<DaemonToWorker, { type: 'init'
   } else if (cfg.cliId === 'cursor') {
     const adoptStartMs = Date.now();
     codexAdoptStartMs = adoptStartMs;
-    codexBridgeQueue.setLocalTurns(true, adoptStartMs);
+    // Cursor transcript events do not carry per-event timestamps. Lark
+    // fingerprint attribution is still safe, but unmatched user events cannot
+    // be reliably classified as fresh local terminal input after restore or
+    // late attach, so disable local-turn synthesis for Cursor.
+    codexBridgeQueue.setLocalTurns(false, adoptStartMs);
     // Resolve the transcript: cliSessionId (= Cursor chatId) when discovery
     // captured it, else the adopt pid via its open store.db fd. Cursor lacks
     // per-event timestamps, so cursorBridgeAttach baselines by byte offset
@@ -4084,8 +4175,17 @@ process.on('message', async (raw: unknown) => {
           // in-flight events from a local-typed prior turn close before
           // this Lark turn's fingerprint window opens. Mark works even
           // pre-attach (queue is path-agnostic).
-          try { codexBridgeIngest(); } catch { /* best effort */ }
-          codexBridgeMarkPendingTurn(content);
+          if (structuredBridgeIsCursor()) {
+            // Cursor may append the current Lark/user line to its transcript
+            // before this IPC message is handled. Mark first so that preexisting
+            // current-line can still fingerprint-match instead of being marked
+            // seen as an unmatched event.
+            codexBridgeMarkPendingTurn(content);
+            try { codexBridgeIngest(); } catch { /* best effort */ }
+          } else {
+            try { codexBridgeIngest(); } catch { /* best effort */ }
+            codexBridgeMarkPendingTurn(content);
+          }
         }
         // Adopt mode write:
         //   - codex routes through cliAdapter.writeInput so the adapter's

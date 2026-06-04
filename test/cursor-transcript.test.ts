@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, writeFileSync, appendFileSync, rmSync, statSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, appendFileSync, rmSync, statSync, mkdirSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -96,6 +96,15 @@ describe('drainCursorTranscript', () => {
     expect(r.newOffset).toBe(0);
   });
 
+  it('keeps the offset when an existing mirror briefly disappears', () => {
+    writeFileSync(path, line(userMsg('first')));
+    const r1 = drainCursorTranscript(path, 0);
+    unlinkSync(path);
+    const r2 = drainCursorTranscript(path, r1.newOffset);
+    expect(r2.events).toEqual([]);
+    expect(r2.newOffset).toBe(r1.newOffset);
+  });
+
   it('extracts user prompt + text-only assistant final', () => {
     writeFileSync(path, line(userMsg('say hi')) + line(assistantFinal('Hi! 👋')));
     const r = drainCursorTranscript(path, 0);
@@ -152,6 +161,19 @@ describe('drainCursorTranscript', () => {
     expect(r.events[0].text).toBe('part one\npart two');
   });
 
+  it('strips Cursor reasoning text appended to a text-only final reply', () => {
+    writeFileSync(path, line(assistantFinal([
+      'Hi, received.',
+      '',
+      '**Considering user response**',
+      '',
+      'This paragraph is internal reasoning from the Cursor transcript mirror.',
+    ].join('\n'))));
+    const r = drainCursorTranscript(path, 0);
+    expect(r.events).toHaveLength(1);
+    expect(r.events[0].text).toBe('Hi, received.');
+  });
+
   it('skips assistant lines with no visible text (tool_use only)', () => {
     writeFileSync(path, line({
       role: 'assistant',
@@ -195,6 +217,17 @@ describe('drainCursorTranscript', () => {
     expect(r.newOffset).toBeLessThan(statSync(path).size);
   });
 
+  it('parses a complete trailing JSON object without a newline', () => {
+    writeFileSync(path, line(userMsg('complete')) + JSON.stringify(assistantFinal('reply without newline')));
+    const r = drainCursorTranscript(path, 0);
+    expect(r.events.map(e => ({ kind: e.kind, text: e.text }))).toEqual([
+      { kind: 'user', text: 'complete' },
+      { kind: 'assistant_final', text: 'reply without newline' },
+    ]);
+    expect(r.pendingTail).toBe('');
+    expect(r.newOffset).toBe(statSync(path).size);
+  });
+
   it('uuid encodes path:byteStart and is stable across re-drains', () => {
     writeFileSync(path, line(userMsg('uuid-one')) + line(userMsg('uuid-two')));
     const r = drainCursorTranscript(path, 0);
@@ -205,14 +238,14 @@ describe('drainCursorTranscript', () => {
     expect(r2.events.map(e => e.uuid)).toEqual(r.events.map(e => e.uuid));
   });
 
-  it('truncated file (size < fromOffset) re-drains from the top', () => {
+  it('keeps the offset when Cursor temporarily rewrites the mirror smaller', () => {
     writeFileSync(path,
       line(userMsg('original message long enough to advance the byte offset')) +
       line(assistantFinal('a reasonably long original answer to take up bytes')));
     const r1 = drainCursorTranscript(path, 0);
     writeFileSync(path, line(userMsg('s')));
     const r2 = drainCursorTranscript(path, r1.newOffset);
-    expect(r2.events).toHaveLength(1);
-    expect(r2.events[0].text).toBe('s');
+    expect(r2.events).toEqual([]);
+    expect(r2.newOffset).toBe(r1.newOffset);
   });
 });

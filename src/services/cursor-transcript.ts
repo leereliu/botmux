@@ -186,16 +186,71 @@ function hasToolUse(content: unknown): boolean {
   return content.some(b => b && typeof b === 'object' && (b as any).type === 'tool_use');
 }
 
+const CURSOR_REASONING_LEAK_HEADING_RE = new RegExp([
+  '\\n{2,}\\*\\*(?:',
+  [
+    'Considering',
+    'Thinking',
+    'Planning',
+    'Inspecting',
+    'Exploring',
+    'Reviewing',
+    'Troubleshooting',
+    'Diagnosing',
+    'Evaluating',
+    'Running',
+    'Checking',
+    'Reading',
+    'Understanding',
+    'Analyzing',
+    'Debugging',
+    'Responding',
+  ].join('|'),
+  ')\\b[^*\\n]{0,80}\\*\\*\\n{2,}',
+].join(''));
+
+function stripCursorReasoningLeak(text: string): string {
+  // Cursor's mirror can append the model's internal planning/debug summary to
+  // the same text-only assistant line that otherwise represents the final user
+  // reply. The leak starts with a bold English activity heading after a blank
+  // paragraph, e.g. "**Considering user response**".
+  const marker = CURSOR_REASONING_LEAK_HEADING_RE.exec(text);
+  if (!marker || marker.index <= 0) return text;
+  return text.slice(0, marker.index).trimEnd();
+}
+
+function eventFromLine(path: string, lineStart: number, obj: any, timestampMs: number): CodexBridgeEvent | undefined {
+  const role = obj?.role ?? obj?.message?.role;
+  const content = obj?.message?.content;
+  if (role === 'user') {
+    const t = joinTextBlocks(content);
+    if (!t) return undefined;
+    return { uuid: `${path}:${lineStart}`, timestampMs, kind: 'user', text: t };
+  }
+  if (role === 'assistant') {
+    // A turn ends with a text-only assistant line; any line carrying a
+    // tool_use block is an intermediate step and must not be forwarded.
+    if (hasToolUse(content)) return undefined;
+    const t = stripCursorReasoningLeak(joinTextBlocks(content));
+    if (!t) return undefined;
+    return { uuid: `${path}:${lineStart}`, timestampMs, kind: 'assistant_final', text: t };
+  }
+  return undefined;
+}
+
 /** Increment-read the transcript from `fromOffset`. Mirrors the byte-offset
  *  contract of codex-transcript.drainCodexRollout so the worker can reuse the
  *  same fs.watch / poll wakeup machinery and the shared CodexBridgeQueue. */
 export function drainCursorTranscript(path: string, fromOffset: number): CursorDrainResult {
-  if (!existsSync(path)) return { events: [], newOffset: 0, pendingTail: '' };
+  if (!existsSync(path)) return { events: [], newOffset: fromOffset, pendingTail: '' };
   let size: number;
   try { size = statSync(path).size; } catch { return { events: [], newOffset: fromOffset, pendingTail: '' }; }
   let start = fromOffset;
-  // Truncated / rotated jsonl — re-read from the top (mirrors Codex/Claude).
-  if (size < start) start = 0;
+  // Cursor's mirror can briefly disappear / shrink while it rewrites. Do not
+  // reset to 0 here: replaying the full history pollutes attribution state and
+  // can wedge a live turn behind old events. Wait for the mirror to grow past
+  // the last consumed byte instead.
+  if (size < start) return { events: [], newOffset: fromOffset, pendingTail: '' };
   if (size === start) return { events: [], newOffset: start, pendingTail: '' };
 
   const len = size - start;
@@ -205,8 +260,8 @@ export function drainCursorTranscript(path: string, fromOffset: number): CursorD
   const text = buf.toString('utf8');
   const lastNl = text.lastIndexOf('\n');
   const completeText = lastNl >= 0 ? text.slice(0, lastNl + 1) : '';
-  const pendingTail = lastNl >= 0 ? text.slice(lastNl + 1) : text;
-  const newOffset = start + Buffer.byteLength(completeText, 'utf8');
+  let pendingTail = lastNl >= 0 ? text.slice(lastNl + 1) : text;
+  let newOffset = start + Buffer.byteLength(completeText, 'utf8');
 
   const events: CodexBridgeEvent[] = [];
   // Track byte offset within the file so synthetic uuids are stable across
@@ -222,23 +277,27 @@ export function drainCursorTranscript(path: string, fromOffset: number): CursorD
     cursor += lineByteLen;
     let obj: any;
     try { obj = JSON.parse(line); } catch { continue; }
-    const role = obj?.role ?? obj?.message?.role;
-    const content = obj?.message?.content;
     // No per-event timestamp in Cursor's JSONL — stamp with the drain
     // wall-clock. Combined with byte-offset baselining at attach, this keeps
     // the CodexBridgeQueue freshness gates happy without a real timestamp.
     const timestampMs = Date.now();
-    if (role === 'user') {
-      const t = joinTextBlocks(content);
-      if (!t) continue;
-      events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'user', text: t });
-    } else if (role === 'assistant') {
-      // A turn ends with a text-only assistant line; any line carrying a
-      // tool_use block is an intermediate step and must not be forwarded.
-      if (hasToolUse(content)) continue;
-      const t = joinTextBlocks(content);
-      if (!t) continue;
-      events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'assistant_final', text: t });
+    const ev = eventFromLine(path, lineStart, obj, timestampMs);
+    if (ev) events.push(ev);
+  }
+
+  // Cursor frequently leaves the final JSON object at EOF without a trailing
+  // newline until the next turn mutates the mirror. If the tail is already a
+  // complete JSON object, consume it now; otherwise keep it pending.
+  if (pendingTail.length > 0) {
+    try {
+      const lineStart = newOffset;
+      const obj = JSON.parse(pendingTail);
+      const ev = eventFromLine(path, lineStart, obj, Date.now());
+      if (ev) events.push(ev);
+      newOffset = size;
+      pendingTail = '';
+    } catch {
+      // Still being written.
     }
   }
   return { events, newOffset, pendingTail };
