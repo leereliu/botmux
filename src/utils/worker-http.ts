@@ -2,10 +2,23 @@ import type { IncomingMessage } from 'node:http';
 
 type EnvLike = Partial<Record<string, string | undefined>>;
 
-export function resolveWorkerHttpHost(env: EnvLike = process.env): string {
+export function getConfiguredWorkerHttpHost(env: EnvLike = process.env): string | undefined {
   const raw = env.BOTMUX_WORKER_HTTP_HOST ?? env.BOTMUX_WORKER_HOST;
   const host = raw?.trim();
-  return host || '127.0.0.1';
+  return host || undefined;
+}
+
+export function resolveWorkerHttpHost(env: EnvLike = process.env): string {
+  return getConfiguredWorkerHttpHost(env) ?? '127.0.0.1';
+}
+
+export function resolveWorkerHttpHostForFork(opts: {
+  env?: EnvLike;
+  terminalProxyPort: number;
+  webHost: string;
+}): string {
+  return getConfiguredWorkerHttpHost(opts.env ?? process.env)
+    ?? (opts.terminalProxyPort > 0 ? '127.0.0.1' : opts.webHost);
 }
 
 export function parseWorkerRequestUrl(req: Pick<IncomingMessage, 'url' | 'headers'>): URL | null {

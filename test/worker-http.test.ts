@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import type { IncomingMessage } from 'node:http';
-import { parseWorkerRequestUrl, resolveWorkerHttpHost } from '../src/utils/worker-http.js';
+import { parseWorkerRequestUrl, resolveWorkerHttpHost, resolveWorkerHttpHostForFork } from '../src/utils/worker-http.js';
 
 function req(url: string | undefined, host?: string): Pick<IncomingMessage, 'url' | 'headers'> {
   return {
@@ -46,5 +46,31 @@ describe('resolveWorkerHttpHost', () => {
 
   it('ignores blank overrides', () => {
     expect(resolveWorkerHttpHost({ BOTMUX_WORKER_HTTP_HOST: '  ' })).toBe('127.0.0.1');
+  });
+});
+
+describe('resolveWorkerHttpHostForFork', () => {
+  it('uses loopback by default when the terminal proxy is available', () => {
+    expect(resolveWorkerHttpHostForFork({
+      env: {},
+      terminalProxyPort: 8801,
+      webHost: '0.0.0.0',
+    })).toBe('127.0.0.1');
+  });
+
+  it('preserves direct worker-port fallback when the terminal proxy is unavailable', () => {
+    expect(resolveWorkerHttpHostForFork({
+      env: {},
+      terminalProxyPort: 0,
+      webHost: '0.0.0.0',
+    })).toBe('0.0.0.0');
+  });
+
+  it('lets explicit worker host override proxy-aware defaults', () => {
+    expect(resolveWorkerHttpHostForFork({
+      env: { BOTMUX_WORKER_HTTP_HOST: '::1' },
+      terminalProxyPort: 0,
+      webHost: '0.0.0.0',
+    })).toBe('::1');
   });
 });

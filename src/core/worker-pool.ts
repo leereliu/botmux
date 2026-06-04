@@ -34,8 +34,9 @@ import type { CliId } from '../adapters/cli/types.js';
 import type { DaemonToWorker, WorkerToDaemon, Session, DisplayMode } from '../types.js';
 import { sessionKey, sessionAnchorId, type DaemonSession } from './types.js';
 import { claimPendingResponseCard, COMPLETED_REACTION_EMOJI_TYPE, markPendingResponseCardPatchedIfCurrent, syncPendingResponseState } from './pending-response.js';
-import { buildTerminalUrl } from './terminal-url.js';
+import { buildTerminalUrl, getTerminalProxyPort } from './terminal-url.js';
 import { usageLimitStateKey, type CliUsageLimitState } from '../utils/cli-usage-limit.js';
+import { resolveWorkerHttpHostForFork } from '../utils/worker-http.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -53,6 +54,14 @@ export interface WorkerPoolCallbacks {
 }
 
 let callbacks: WorkerPoolCallbacks | undefined;
+
+function workerHttpHostForFork(): string {
+  return resolveWorkerHttpHostForFork({
+    env: process.env,
+    terminalProxyPort: getTerminalProxyPort(),
+    webHost: config.web.host,
+  });
+}
 
 /**
  * Initialise worker-pool callbacks. Must be called once before forkWorker().
@@ -1238,6 +1247,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
       CLAUDECODE: undefined,
       BOTMUX: '1',  // Marker so user scripts/skills can detect a botmux-spawned CLI
       SESSION_DATA_DIR: config.session.dataDir,
+      BOTMUX_WORKER_HTTP_HOST: workerHttpHostForFork(),
       LARK_APP_ID: botCfg.larkAppId,
       LARK_APP_SECRET: botCfg.larkAppSecret,
     },
@@ -2043,6 +2053,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
       ...process.env,
       CLAUDECODE: undefined,
       BOTMUX: '1',
+      BOTMUX_WORKER_HTTP_HOST: workerHttpHostForFork(),
       LARK_APP_ID: botCfg.larkAppId,
       LARK_APP_SECRET: botCfg.larkAppSecret,
     },
