@@ -103,6 +103,10 @@ export default defineConfig({
                         "link": "/dashboard"
                   },
                   {
+                        "text": "接入点（Webhook）",
+                        "link": "/webhook"
+                  },
+                  {
                         "text": "Workflow（实验性）",
                         "link": "/workflow"
                   },
