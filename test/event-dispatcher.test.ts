@@ -482,6 +482,206 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 
+  it('still drops an unknown-peer bot even when it sends /t (no force-topic gate bypass)', async () => {
+    // 关键回归：bot-sender 的 `/t` override 把 chat-scope 翻成 thread-scope，但
+    // 它必须排在 vetting gate 之后。否则随机第三方 bot 发 `@bot /t …` 会让闸门
+    // 的 `ctx.scope === 'chat' || source === 'regular-group-thread'` 两条件全 false
+    // → 绕过 vetting → 静默 spawn 一个 thread-scope 会话。这条用例锁死「不能绕」。
+    mockGetChatMode.mockResolvedValueOnce('group');  // 普通群, regularGroupReplyInThread off → source=regular-group-chat
+    mockReadFileSync.mockReturnValue('{}');  // empty cross-ref → unknown peer
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      content: JSON.stringify({
+        zh_cn: { content: [[
+          { tag: 'at', user_id: MY_OPEN_ID },
+          { tag: 'text', text: ' /t spawn me' },
+        ]] },
+      }),
+      rootId: undefined,
+    });
+    event.message.root_id = undefined as any;
+    handlers.isSessionOwner.mockReturnValue(false);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('lets a KNOWN-peer bot use /t to seed a fresh topic in 普通群', async () => {
+    // 合法用例：已登记 peer bot（cross-ref 命中）发 `@bot /t …` 交接，过 vetting
+    // gate 后 override 生效，把 chat-scope 翻成 thread-scope 开新话题。与上面的
+    // 「unknown peer + /t 被 drop」对照，证明修复只挡未授权 bot、不误伤交接。
+    mockGetChatMode.mockResolvedValueOnce('group');
+    mockReadFileSync.mockReturnValue(JSON.stringify({ 'BotB': OTHER_BOT_OPEN_ID }));  // known peer
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      content: JSON.stringify({
+        zh_cn: { content: [[
+          { tag: 'at', user_id: MY_OPEN_ID },
+          { tag: 'text', text: ' /t spawn me' },
+        ]] },
+      }),
+      rootId: undefined,
+    });
+    event.message.root_id = undefined as any;
+    handlers.isSessionOwner.mockReturnValue(false);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'msg-001',
+      larkAppId: MY_APP_ID,
+    }));
+  });
+
+  it('still drops an unknown-peer bot /t when this bot owns a chat-scope session (stale-anchor ownsSession must not exempt)', async () => {
+    // 关键回归（Codex gate 抓到）：vetting gate 的 ownsSession 放行口是「外部 bot
+    // 跟进我们已拥有的会话」。但 /t 会把 anchor 从 chatId 改成新的 messageId——
+    // 我们在新 anchor 上不拥有任何会话。所以 gate 必须按 override 之后的 anchor 算
+    // ownsSession，否则未授权 bot 借旧 chat-scope session 的归属绕过 vetting，再被
+    // /t 翻成 thread 后在新 anchor 上 auto-create 出一个会话。
+    mockGetChatMode.mockResolvedValueOnce('group');
+    mockReadFileSync.mockReturnValue('{}');  // empty cross-ref → unknown peer
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      content: JSON.stringify({
+        zh_cn: { content: [[
+          { tag: 'at', user_id: MY_OPEN_ID },
+          { tag: 'text', text: ' /t spawn me' },
+        ]] },
+      }),
+      rootId: undefined,
+    });
+    event.message.root_id = undefined as any;
+    // bot already owns the chat-scope session at chat-001 (the OLD anchor)
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'chat-001');
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('still drops an unknown-peer bot on the /topic alias too (alias must not bypass either)', async () => {
+    // /t 和 /topic 走同一条 parseForceTopicInvocation，别让别名成为绕过 vetting 的后门。
+    mockGetChatMode.mockResolvedValueOnce('group');
+    mockReadFileSync.mockReturnValue('{}');  // empty cross-ref → unknown peer
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      content: JSON.stringify({
+        zh_cn: { content: [[
+          { tag: 'at', user_id: MY_OPEN_ID },
+          { tag: 'text', text: ' /topic spawn me' },
+        ]] },
+      }),
+      rootId: undefined,
+    });
+    event.message.root_id = undefined as any;
+    handlers.isSessionOwner.mockReturnValue(false);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('lets a chat-granted bot use /t to seed a topic (override reachable past the grant exemption)', async () => {
+    // 闸门的另一条放行口：chatGrants。override 排在闸门之后，仍须能被这条放行路径到达。
+    setupBotState({ chatGrants: { 'chat-001': [OTHER_BOT_OPEN_ID] } });
+    mockGetChatMode.mockResolvedValueOnce('group');
+    mockReadFileSync.mockReturnValue('{}');  // empty cross-ref → unknown peer，唯一放行靠 grant
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      content: JSON.stringify({
+        zh_cn: { content: [[
+          { tag: 'at', user_id: MY_OPEN_ID },
+          { tag: 'text', text: ' /t spawn me' },
+        ]] },
+      }),
+      rootId: undefined,
+    });
+    event.message.root_id = undefined as any;
+    handlers.isSessionOwner.mockReturnValue(false);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'msg-001',
+      larkAppId: MY_APP_ID,
+    }));
+  });
+
+  it('lets a globally-granted bot use /t to seed a topic (override reachable past the global grant)', async () => {
+    setupBotState({ globalGrants: [OTHER_BOT_OPEN_ID] });
+    mockGetChatMode.mockResolvedValueOnce('group');
+    mockReadFileSync.mockReturnValue('{}');  // empty cross-ref → unknown peer
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      content: JSON.stringify({
+        zh_cn: { content: [[
+          { tag: 'at', user_id: MY_OPEN_ID },
+          { tag: 'text', text: ' /t spawn me' },
+        ]] },
+      }),
+      rootId: undefined,
+    });
+    event.message.root_id = undefined as any;
+    handlers.isSessionOwner.mockReturnValue(false);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'msg-001',
+      larkAppId: MY_APP_ID,
+    }));
+  });
+
+  it('lets a bot use /t to seed a topic in an oncall chat (override reachable past the oncall exemption)', async () => {
+    // oncall 短路整段 gate（!findOncallChat），override 仍须落在它后面照常翻 thread。
+    mockGetChatMode.mockResolvedValueOnce('group');
+    mockIsChatOncallBoundForAnyBot.mockReturnValue(true);
+    mockFindOncallChat.mockReturnValue({ chatId: 'chat-001', workingDir: '/repo' });
+    mockReadFileSync.mockReturnValue('{}');  // empty cross-ref → unknown peer，靠 oncall 放行
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      content: JSON.stringify({
+        zh_cn: { content: [[
+          { tag: 'at', user_id: MY_OPEN_ID },
+          { tag: 'text', text: ' /t spawn me' },
+        ]] },
+      }),
+      rootId: undefined,
+    });
+    event.message.root_id = undefined as any;
+    handlers.isSessionOwner.mockReturnValue(false);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'msg-001',
+      larkAppId: MY_APP_ID,
+    }));
+  });
+
   it('routes unknown-peer cross-bot @mention in chat-scope when the bot is chat-granted via /grant', async () => {
     // owner 用 `/grant @bot` 把外部 bot 加进本群 chatGrants：即便它不在 peer
     // cross-ref（isKnownPeerBot=false），命中 chatGrants 也应与已注册 peer 同等
