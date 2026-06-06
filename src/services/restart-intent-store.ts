@@ -1,6 +1,6 @@
 /**
  * Restart-intent breadcrumb: a small file written just before an *intentional*
- * restart (manual `botmux restart`, scheduled auto-restart, or auto-update).
+ * restart (manual `botmux restart`, or an auto-update that restarts to apply).
  * On the next daemon startup the primary daemon consumes it to decide whether
  * to DM the owner a restart summary.
  *
@@ -13,7 +13,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync 
 import { join } from 'node:path';
 import { config } from '../config.js';
 
-export type RestartKind = 'manual' | 'auto-restart' | 'update';
+export type RestartKind = 'manual' | 'update';
 
 export interface RestartIntent {
   kind: RestartKind;
@@ -75,7 +75,7 @@ export function consumeRestartIntentTo(dir: string, nowMs: number): RestartInten
 }
 
 /** Write a `manual` breadcrumb only when no *fresh* breadcrumb already exists —
- *  so a maintenance-written `update`/`auto-restart` breadcrumb is not clobbered
+ *  so a maintenance-written `update` breadcrumb is not clobbered
  *  by the `botmux restart` it spawns. */
 export function writeManualIntentIfAbsentTo(dir: string, nowMs: number, atIso: string): void {
   const existing = readRaw(dir);

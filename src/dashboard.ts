@@ -483,6 +483,14 @@ const server = createServer(async (req, res) => {
         if (r.patch.autoUpdate?.enabled && isLocalDevInstall()) {
           return jsonRes(res, 400, { ok: false, error: 'local_dev_no_autoupdate' });
         }
+        // Auto-restart only applies an auto-update — it's meaningless without it.
+        // Refuse enabling auto-restart unless auto-update is (or is being) on.
+        if (r.patch.autoRestart?.enabled) {
+          const autoUpdateOn = r.patch.autoUpdate?.enabled
+            ?? readGlobalConfig().maintenance?.autoUpdate?.enabled
+            ?? false;
+          if (!autoUpdateOn) return jsonRes(res, 400, { ok: false, error: 'autoupdate_required' });
+        }
         mergeMaintenanceConfig(r.patch);
         touched = true;
       }

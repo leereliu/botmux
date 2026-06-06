@@ -16,65 +16,54 @@ import type { RestartIntent } from '../src/services/restart-intent-store.js';
 const NOON = Date.parse('2026-06-07T04:00:00.000Z');
 const TODAY = '2026-06-07';
 
-function makeDeps(cfg: MaintenanceConfig, init: MaintenanceState = {}, over: Partial<MaintenanceDeps> = {}) {
-  const state: MaintenanceState = JSON.parse(JSON.stringify(init));
-  const calls = { restart: 0, update: 0, writes: 0, intents: [] as RestartIntent[], logs: [] as string[] };
+interface Opts {
+  init?: MaintenanceState;
+  startVer?: string;
+  installTo?: string;   // on-disk version after runUpdate (same as startVer ⇒ no change)
+  busy?: boolean;
+  localDev?: boolean;
+  updateThrows?: boolean;
+}
+
+function makeDeps(cfg: MaintenanceConfig, opts: Opts = {}) {
+  const state: MaintenanceState = JSON.parse(JSON.stringify(opts.init ?? {}));
+  const calls = { update: 0, restart: 0, writes: 0, intents: [] as RestartIntent[], logs: [] as string[] };
+  let ver = opts.startVer ?? '2.64.0';
+  const installTo = opts.installTo ?? '2.65.0';
   const deps: MaintenanceDeps = {
     now: () => NOON,
     readConfig: () => cfg,
     readState: () => state,
     writeState: () => { calls.writes++; },
-    anyBusy: () => false,
-    isLocalDev: () => false,
-    currentVersion: () => '2.64.0',
-    runUpdate: () => { calls.update++; return { newVersion: '2.65.0' }; },
+    anyBusy: () => opts.busy ?? false,
+    isLocalDev: () => opts.localDev ?? false,
+    currentVersion: () => ver,
+    runUpdate: () => { calls.update++; if (opts.updateThrows) throw new Error('npm fail'); ver = installTo; },
     writeIntent: (i) => { calls.intents.push(i); },
     triggerRestart: () => { calls.restart++; },
     log: (m) => { calls.logs.push(m); },
-    ...over,
   };
   return { deps, calls, state };
 }
 
 describe('runMaintenanceTick', () => {
-  it('does nothing when neither task is enabled', () => {
+  it('does nothing when auto-update is disabled (even if auto-restart is on)', () => {
+    const { deps, calls } = makeDeps({ autoUpdate: { enabled: false, time: '12:00' }, autoRestart: { enabled: true } });
+    runMaintenanceTick(deps);
+    expect(calls.update).toBe(0);
+    expect(calls.restart).toBe(0);
+    expect(calls.writes).toBe(0);
+  });
+
+  it('does nothing when there is no maintenance config', () => {
     const { deps, calls } = makeDeps({});
     runMaintenanceTick(deps);
+    expect(calls.update).toBe(0);
     expect(calls.restart).toBe(0);
-    expect(calls.writes).toBe(0);
   });
 
-  it('auto-restart due + idle → triggers one restart with an auto-restart intent, marks today', () => {
-    const { deps, calls, state } = makeDeps({ autoRestart: { enabled: true, time: '12:00' } });
-    runMaintenanceTick(deps);
-    expect(calls.restart).toBe(1);
-    expect(calls.intents).toEqual([expect.objectContaining({ kind: 'auto-restart' })]);
-    expect(state.autoRestart?.lastDate).toBe(TODAY);
-  });
-
-  it('auto-restart due + BUSY → no restart, but marks today (slips to next day)', () => {
-    const { deps, calls, state } = makeDeps({ autoRestart: { enabled: true, time: '12:00' } }, {}, { anyBusy: () => true });
-    runMaintenanceTick(deps);
-    expect(calls.restart).toBe(0);
-    expect(state.autoRestart?.lastDate).toBe(TODAY);
-  });
-
-  it('auto-restart already handled today → no restart, no state write', () => {
-    const { deps, calls } = makeDeps({ autoRestart: { enabled: true, time: '12:00' } }, { autoRestart: { lastDate: TODAY } });
-    runMaintenanceTick(deps);
-    expect(calls.restart).toBe(0);
-    expect(calls.writes).toBe(0);
-  });
-
-  it('auto-restart missed (past grace) → no restart, marks today', () => {
-    const { deps, calls, state } = makeDeps({ autoRestart: { enabled: true, time: '10:00' } }); // 120 min late
-    runMaintenanceTick(deps);
-    expect(calls.restart).toBe(0);
-    expect(state.autoRestart?.lastDate).toBe(TODAY);
-  });
-
-  it('auto-update due + new version → runs update, writes update intent, restarts, marks', () => {
-    const { deps, calls, state } = makeDeps({ autoUpdate: { enabled: true, time: '12:00' } });
+  it('due + new version + auto-restart ON → installs, writes update intent, restarts, marks today', () => {
+    const { deps, calls, state } = makeDeps({ autoUpdate: { enabled: true, time: '12:00' }, autoRestart: { enabled: true } });
     runMaintenanceTick(deps);
     expect(calls.update).toBe(1);
     expect(calls.restart).toBe(1);
@@ -82,50 +71,77 @@ describe('runMaintenanceTick', () => {
     expect(state.autoUpdate?.lastDate).toBe(TODAY);
   });
 
-  it('auto-update due but already on latest → no restart, no intent, marks', () => {
-    const { deps, calls, state } = makeDeps({ autoUpdate: { enabled: true, time: '12:00' } }, {}, {
-      runUpdate: () => ({ newVersion: '2.64.0' }), // same as currentVersion
-    });
+  it('due + new version + auto-restart OFF → installs but does NOT restart (applied on next restart)', () => {
+    const { deps, calls, state } = makeDeps({ autoUpdate: { enabled: true, time: '12:00' } }); // no autoRestart
     runMaintenanceTick(deps);
+    expect(calls.update).toBe(1);
     expect(calls.restart).toBe(0);
     expect(calls.intents).toEqual([]);
     expect(state.autoUpdate?.lastDate).toBe(TODAY);
   });
 
-  it('auto-update due on a local-dev install → never runs npm, no restart, marks (skip)', () => {
-    let updateRan = 0;
-    const { deps, calls, state } = makeDeps({ autoUpdate: { enabled: true, time: '12:00' } }, {}, {
-      isLocalDev: () => true,
-      runUpdate: () => { updateRan++; return { newVersion: '2.65.0' }; },
-    });
+  it('due but already on the latest version → installs (no-op), no restart, marks', () => {
+    const { deps, calls } = makeDeps(
+      { autoUpdate: { enabled: true, time: '12:00' }, autoRestart: { enabled: true } },
+      { startVer: '2.65.0', installTo: '2.65.0' }, // install changes nothing
+    );
     runMaintenanceTick(deps);
-    expect(updateRan).toBe(0);
+    expect(calls.update).toBe(1);
+    expect(calls.restart).toBe(0);
+    expect(calls.intents).toEqual([]);
+  });
+
+  it('due but BUSY → does not even run npm, marks today (slips to next day)', () => {
+    const { deps, calls, state } = makeDeps(
+      { autoUpdate: { enabled: true, time: '12:00' }, autoRestart: { enabled: true } },
+      { busy: true },
+    );
+    runMaintenanceTick(deps);
+    expect(calls.update).toBe(0);
     expect(calls.restart).toBe(0);
     expect(state.autoUpdate?.lastDate).toBe(TODAY);
   });
 
-  it('auto-update due + BUSY → does not run npm, marks (slips to next day)', () => {
-    let updateRan = 0;
-    const { deps, calls } = makeDeps({ autoUpdate: { enabled: true, time: '12:00' } }, {}, {
-      anyBusy: () => true,
-      runUpdate: () => { updateRan++; return { newVersion: '2.65.0' }; },
-    });
+  it('due on a local-dev install → never runs npm, no restart, marks (skip)', () => {
+    const { deps, calls, state } = makeDeps(
+      { autoUpdate: { enabled: true, time: '12:00' }, autoRestart: { enabled: true } },
+      { localDev: true },
+    );
     runMaintenanceTick(deps);
-    expect(updateRan).toBe(0);
+    expect(calls.update).toBe(0);
     expect(calls.restart).toBe(0);
+    expect(state.autoUpdate?.lastDate).toBe(TODAY);
   });
 
-  it('both tasks due in the same tick → exactly ONE restart, both marked', () => {
-    const { deps, calls, state } = makeDeps({
-      autoUpdate: { enabled: true, time: '12:00' },
-      autoRestart: { enabled: true, time: '12:00' },
-    });
+  it('already handled today → no install, no restart, no state write', () => {
+    const { deps, calls } = makeDeps(
+      { autoUpdate: { enabled: true, time: '12:00' }, autoRestart: { enabled: true } },
+      { init: { autoUpdate: { lastDate: TODAY } } },
+    );
     runMaintenanceTick(deps);
-    expect(calls.restart).toBe(1);
-    expect(calls.intents).toHaveLength(1);
-    expect(calls.intents[0].kind).toBe('update');
+    expect(calls.update).toBe(0);
+    expect(calls.restart).toBe(0);
+    expect(calls.writes).toBe(0);
+  });
+
+  it('missed (past grace) → no install, marks today', () => {
+    const { deps, calls, state } = makeDeps({ autoUpdate: { enabled: true, time: '10:00' }, autoRestart: { enabled: true } });
+    runMaintenanceTick(deps);
+    expect(calls.update).toBe(0);
+    expect(calls.restart).toBe(0);
     expect(state.autoUpdate?.lastDate).toBe(TODAY);
-    expect(state.autoRestart?.lastDate).toBe(TODAY);
+  });
+
+  it('npm install failure → no restart, no intent (still marked, retries next day)', () => {
+    const { deps, calls, state } = makeDeps(
+      { autoUpdate: { enabled: true, time: '12:00' }, autoRestart: { enabled: true } },
+      { updateThrows: true },
+    );
+    runMaintenanceTick(deps);
+    expect(calls.update).toBe(1);
+    expect(calls.restart).toBe(0);
+    expect(calls.intents).toEqual([]);
+    expect(state.autoUpdate?.lastDate).toBe(TODAY);
   });
 });
 
@@ -136,8 +152,8 @@ describe('maintenance-state store', () => {
 
   it('reads {} when absent and round-trips after a write', () => {
     expect(readMaintenanceStateTo(dir)).toEqual({});
-    writeMaintenanceStateTo(dir, { autoRestart: { lastDate: '2026-06-07' } });
-    expect(readMaintenanceStateTo(dir)).toEqual({ autoRestart: { lastDate: '2026-06-07' } });
+    writeMaintenanceStateTo(dir, { autoUpdate: { lastDate: '2026-06-07' } });
+    expect(readMaintenanceStateTo(dir)).toEqual({ autoUpdate: { lastDate: '2026-06-07' } });
   });
 
   it('tolerates a corrupt state file (reads as {})', () => {

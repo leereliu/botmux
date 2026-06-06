@@ -47,7 +47,7 @@ describe('restart-intent store', () => {
   });
 
   it('writeManualIntentIfAbsent overwrites a stale intent', () => {
-    writeRestartIntentTo(dir, { kind: 'auto-restart', at: iso(T0) });
+    writeRestartIntentTo(dir, { kind: 'update', oldVersion: '1', newVersion: '2', at: iso(T0) });
     writeManualIntentIfAbsentTo(dir, T0 + 11 * 60_000, iso(T0 + 11 * 60_000));
     expect(consumeRestartIntentTo(dir, T0 + 11 * 60_000 + 1_000)).toMatchObject({ kind: 'manual' });
   });

@@ -1,5 +1,5 @@
 /**
- * Restart-report DM: after an *intentional* restart (manual / auto-restart /
+ * Restart-report DM: after an *intentional* restart (manual /
  * auto-update), the primary daemon (bot-0) privately messages the owner a
  * summary — dashboard link, unfinished-session count, version, and (for an
  * update) the changelog. This replaces re-posting streaming cards into the
@@ -33,11 +33,7 @@ function vtag(v: string): string {
 /** The human-facing markdown body of the report. Pure — unit tested. */
 export function buildRestartReportText(input: RestartReportInput): string {
   const lines: string[] = [];
-  lines.push(
-    input.kind === 'update' ? '🔄 **botmux 已更新并重启**'
-    : input.kind === 'auto-restart' ? '🔄 **botmux 已自动重启**'
-    : '🔄 **botmux 已重启**',
-  );
+  lines.push(input.kind === 'update' ? '🔄 **botmux 已更新并重启**' : '🔄 **botmux 已重启**');
 
   if (input.kind === 'update' && input.oldVersion && input.newVersion) {
     lines.push(`版本：${vtag(input.oldVersion)} → ${vtag(input.newVersion)}`);

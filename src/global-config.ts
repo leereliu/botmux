@@ -42,17 +42,25 @@ export interface GlobalConfig {
 }
 
 export interface MaintenanceConfig {
-  /** Run `npm install -g botmux@latest` at `time`, restart to apply if the
-   *  version changed. npm-global installs only (disabled for local-dev). */
+  /** At `time` (once/day) run `npm install -g botmux@latest` to install the
+   *  latest version — download/install only, never restarts on its own.
+   *  npm-global installs only (disabled for local-dev). */
   autoUpdate?: MaintenanceTask;
-  /** Restart the daemons at `time` (memory hygiene / recovery). */
-  autoRestart?: MaintenanceTask;
+  /** When enabled (and autoUpdate is on), restart right after a successful
+   *  auto-update that installed a newer version, to apply it. No schedule of
+   *  its own — reuses autoUpdate's time, fires only when there's a pending
+   *  update. */
+  autoRestart?: MaintenanceToggle;
 }
 
 export interface MaintenanceTask {
   enabled?: boolean;
   /** Local-time (Asia/Shanghai) "HH:MM", once per day. */
   time?: string;
+}
+
+export interface MaintenanceToggle {
+  enabled?: boolean;
 }
 
 export interface DashboardGlobalConfig {
@@ -91,19 +99,24 @@ function readMaintenanceTask(raw: unknown): MaintenanceTask | undefined {
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
-/** Validate a maintenance patch from the dashboard PUT. Type-strict (rejects a
- *  bad time / non-boolean enabled / non-object task) but lenient on
- *  completeness — an enabled task without a time is stored and treated as
- *  inactive by the timer until a valid time is set. */
+function readMaintenanceToggle(raw: unknown): MaintenanceToggle | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.enabled !== 'boolean') return undefined;
+  return { enabled: r.enabled };
+}
+
+/** Validate a maintenance patch from the dashboard PUT. Type-strict on enabled
+ *  (both keys) and on autoUpdate's time. autoRestart is a toggle — any `time`
+ *  on it is ignored (it reuses autoUpdate's schedule). */
 export function parseMaintenancePatch(
   body: unknown,
 ): { ok: true; patch: MaintenanceConfig } | { ok: false; error: string } {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return { ok: false, error: 'empty' };
   const b = body as Record<string, unknown>;
   const patch: MaintenanceConfig = {};
-  for (const key of ['autoUpdate', 'autoRestart'] as const) {
-    if (!(key in b)) continue;
-    const raw = b[key];
+  if ('autoUpdate' in b) {
+    const raw = b.autoUpdate;
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { ok: false, error: 'invalid_task' };
     const t = raw as Record<string, unknown>;
     const task: MaintenanceTask = {};
@@ -115,7 +128,18 @@ export function parseMaintenancePatch(
       if (typeof t.time !== 'string' || !isValidHhMm(t.time)) return { ok: false, error: 'invalid_time' };
       task.time = t.time;
     }
-    patch[key] = task;
+    patch.autoUpdate = task;
+  }
+  if ('autoRestart' in b) {
+    const raw = b.autoRestart;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { ok: false, error: 'invalid_task' };
+    const t = raw as Record<string, unknown>;
+    const toggle: MaintenanceToggle = {};
+    if ('enabled' in t) {
+      if (typeof t.enabled !== 'boolean') return { ok: false, error: 'invalid_enabled' };
+      toggle.enabled = t.enabled;
+    }
+    patch.autoRestart = toggle;
   }
   if (Object.keys(patch).length === 0) return { ok: false, error: 'empty' };
   return { ok: true, patch };
@@ -127,7 +151,7 @@ function readMaintenance(raw: unknown): MaintenanceConfig | undefined {
   const out: MaintenanceConfig = {};
   const au = readMaintenanceTask(m.autoUpdate);
   if (au) out.autoUpdate = au;
-  const ar = readMaintenanceTask(m.autoRestart);
+  const ar = readMaintenanceToggle(m.autoRestart);
   if (ar) out.autoRestart = ar;
   return Object.keys(out).length > 0 ? out : undefined;
 }

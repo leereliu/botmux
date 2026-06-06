@@ -27,8 +27,8 @@ import { writeRestartIntent, type RestartIntent } from '../services/restart-inte
 import { isLocalDevInstall, botmuxVersion, botmuxCliEntry } from '../utils/install-info.js';
 
 export interface MaintenanceState {
+  /** Local date the auto-update run was last handled (fired or skipped). */
   autoUpdate?: { lastDate: string };
-  autoRestart?: { lastDate: string };
 }
 
 export interface MaintenanceDeps {
@@ -38,71 +38,68 @@ export interface MaintenanceDeps {
   writeState: (s: MaintenanceState) => void;
   anyBusy: () => boolean;
   isLocalDev: () => boolean;
-  /** botmux version before an update (read fresh each call). */
+  /** Current on-disk botmux version (read fresh — changes after runUpdate). */
   currentVersion: () => string;
-  /** Runs `npm install -g botmux@latest` and reports the resulting version.
-   *  Throws on failure. */
-  runUpdate: () => { newVersion: string };
+  /** Runs `npm install -g botmux@latest` (download/install only). Throws on failure. */
+  runUpdate: () => void;
   writeIntent: (intent: RestartIntent) => void;
   /** Spawn a detached `botmux restart` (this process is then killed by pm2). */
   triggerRestart: () => void;
   log?: (msg: string) => void;
 }
 
-/** One maintenance tick. Pure orchestration over injected deps. */
+/**
+ * One maintenance tick. The schedule is driven solely by auto-update's time
+ * (once/day). At that time: install the latest version (download only), and
+ * — only if a newer version was actually installed AND the auto-restart toggle
+ * is on — restart to apply it. A busy session anywhere skips the whole run to
+ * the next day; auto-restart off ⇒ install only (applied on the next restart).
+ * Pure orchestration over injected deps.
+ */
 export function runMaintenanceTick(deps: MaintenanceDeps): void {
   const cfg = deps.readConfig();
-  if (!cfg || (!cfg.autoUpdate?.enabled && !cfg.autoRestart?.enabled)) return;
+  if (!cfg?.autoUpdate?.enabled) return; // auto-restart has no schedule of its own
 
   const now = deps.now();
   const state = deps.readState();
-  const busy = deps.anyBusy();
   const log = deps.log ?? (() => {});
-  let restarted = false;
 
-  const mark = (key: 'autoUpdate' | 'autoRestart', markDate: string) => {
-    state[key] = { lastDate: markDate };
+  const upd = evaluateDue(cfg.autoUpdate, state.autoUpdate?.lastDate, now);
+  if ((upd.decision === 'due' || upd.decision === 'missed') && upd.markDate) {
+    state.autoUpdate = { lastDate: upd.markDate };
     deps.writeState(state);
-  };
+  }
+  if (upd.decision !== 'due') return;
 
-  // ---- auto-update ----
-  const upd = evaluateDue(cfg.autoUpdate ?? {}, state.autoUpdate?.lastDate, now);
-  if ((upd.decision === 'due' || upd.decision === 'missed') && upd.markDate) mark('autoUpdate', upd.markDate);
-  if (upd.decision === 'due') {
-    if (deps.isLocalDev()) {
-      log('auto-update skipped: local-dev install (npm-global only)');
-    } else if (busy) {
-      log('auto-update skipped: a session is busy — slipping to next day');
-    } else {
-      try {
-        const before = deps.currentVersion();
-        const { newVersion } = deps.runUpdate();
-        if (newVersion && newVersion !== before) {
-          deps.writeIntent({ kind: 'update', oldVersion: before, newVersion, at: new Date(now).toISOString() });
-          deps.triggerRestart();
-          restarted = true;
-          log(`auto-update: ${before} → ${newVersion}, restarting`);
-        } else {
-          log('auto-update: already on the latest version, no restart');
-        }
-      } catch (e) {
-        log(`auto-update failed: ${e instanceof Error ? e.message : e}`);
-      }
-    }
+  if (deps.isLocalDev()) {
+    log('auto-update skipped: local-dev install (npm-global only)');
+    return;
+  }
+  if (deps.anyBusy()) {
+    log('auto-update skipped: a session is busy — slipping to next day');
+    return;
   }
 
-  // ---- auto-restart ----
-  const res = evaluateDue(cfg.autoRestart ?? {}, state.autoRestart?.lastDate, now);
-  if ((res.decision === 'due' || res.decision === 'missed') && res.markDate) mark('autoRestart', res.markDate);
-  if (res.decision === 'due' && !restarted) {
-    if (busy) {
-      log('auto-restart skipped: a session is busy — slipping to next day');
-    } else {
-      deps.writeIntent({ kind: 'auto-restart', at: new Date(now).toISOString() });
-      deps.triggerRestart();
-      restarted = true;
-      log('auto-restart: restarting');
-    }
+  const before = deps.currentVersion();
+  try {
+    deps.runUpdate();
+  } catch (e) {
+    log(`auto-update failed: ${e instanceof Error ? e.message : e}`);
+    return;
+  }
+  const after = deps.currentVersion();
+  if (after === before) {
+    log('auto-update: already on the latest version');
+    return;
+  }
+
+  // A newer version was installed. Restart to apply it only if opted in.
+  if (cfg.autoRestart?.enabled) {
+    deps.writeIntent({ kind: 'update', oldVersion: before, newVersion: after, at: new Date(now).toISOString() });
+    deps.triggerRestart();
+    log(`auto-update: ${before} → ${after}, restarting to apply`);
+  } else {
+    log(`auto-update: installed ${after} (was ${before}); auto-restart off — applies on next restart`);
   }
 }
 
@@ -150,7 +147,6 @@ function productionDeps(): MaintenanceDeps {
     currentVersion: () => botmuxVersion(),
     runUpdate: () => {
       execSync('npm install -g botmux@latest', { stdio: 'inherit' });
-      return { newVersion: botmuxVersion() };
     },
     writeIntent: (intent) => writeRestartIntent(intent),
     triggerRestart: () => {

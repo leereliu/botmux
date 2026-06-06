@@ -46,88 +46,86 @@ describe('maintenance global config', () => {
     expect(readGlobalConfig().maintenance).toBeUndefined();
   });
 
-  it('parses valid autoUpdate / autoRestart blocks', () => {
+  it('autoUpdate keeps {enabled,time}; autoRestart is a toggle (time ignored)', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({
       maintenance: {
         autoUpdate: { enabled: true, time: '04:00' },
-        autoRestart: { enabled: false, time: '4:30' },
+        autoRestart: { enabled: true, time: '4:30' }, // time on autoRestart is meaningless now
       },
     }));
     expect(readGlobalConfig().maintenance).toEqual({
       autoUpdate: { enabled: true, time: '04:00' },
-      autoRestart: { enabled: false, time: '4:30' },
+      autoRestart: { enabled: true },
     });
   });
 
-  it('drops invalid time and non-boolean enabled, keeps the rest', () => {
+  it('drops invalid autoUpdate time / non-boolean enabled, keeps the rest', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({
       maintenance: {
-        autoUpdate: { enabled: 'yes', time: '99:99' },
-        autoRestart: { enabled: true, time: '02:15' },
+        autoUpdate: { enabled: 'yes', time: '99:99' }, // both invalid → dropped
+        autoRestart: { enabled: false },
       },
     }));
-    // autoUpdate: both fields invalid → dropped entirely
-    // autoRestart: valid → kept
     expect(readGlobalConfig().maintenance).toEqual({
-      autoRestart: { enabled: true, time: '02:15' },
+      autoRestart: { enabled: false },
     });
   });
 
-  it('mergeMaintenanceConfig round-trips and preserves unknown sibling keys', () => {
+  it('mergeMaintenanceConfig round-trips autoUpdate time and preserves unknown sibling keys', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({
       lang: 'zh',
       dashboard: { publicReadOnly: true },
     }));
-    const merged = mergeMaintenanceConfig({ autoRestart: { enabled: true, time: '03:00' } });
-    expect(merged.autoRestart).toEqual({ enabled: true, time: '03:00' });
+    const merged = mergeMaintenanceConfig({ autoUpdate: { enabled: true, time: '03:00' } });
+    expect(merged.autoUpdate).toEqual({ enabled: true, time: '03:00' });
     const raw = JSON.parse(readFileSync(globalConfigPath(), 'utf8'));
     expect(raw.lang).toBe('zh');
     expect(raw.dashboard.publicReadOnly).toBe(true);
-    expect(raw.maintenance.autoRestart).toEqual({ enabled: true, time: '03:00' });
+    expect(raw.maintenance.autoUpdate).toEqual({ enabled: true, time: '03:00' });
   });
 
-  it('mergeMaintenanceConfig merges into existing maintenance without dropping the other task', () => {
+  it('mergeMaintenanceConfig merges into existing maintenance without dropping the other key', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({
       maintenance: { autoUpdate: { enabled: true, time: '05:00' } },
     }));
-    mergeMaintenanceConfig({ autoRestart: { enabled: true, time: '06:00' } });
+    mergeMaintenanceConfig({ autoRestart: { enabled: true } });
     const m = readGlobalConfig().maintenance;
     expect(m?.autoUpdate).toEqual({ enabled: true, time: '05:00' });
-    expect(m?.autoRestart).toEqual({ enabled: true, time: '06:00' });
+    expect(m?.autoRestart).toEqual({ enabled: true });
   });
 
   it('read-after-merge sees fresh value immediately (cache invalidation)', () => {
-    writeFileSync(globalConfigPath(), JSON.stringify({ maintenance: { autoRestart: { enabled: false, time: '01:00' } } }));
+    writeFileSync(globalConfigPath(), JSON.stringify({ maintenance: { autoRestart: { enabled: false } } }));
     expect(readGlobalConfig().maintenance?.autoRestart?.enabled).toBe(false); // prime cache
-    mergeMaintenanceConfig({ autoRestart: { enabled: true, time: '01:00' } });
+    mergeMaintenanceConfig({ autoRestart: { enabled: true } });
     expect(readGlobalConfig().maintenance?.autoRestart?.enabled).toBe(true);
   });
 });
 
 describe('parseMaintenancePatch (dashboard PUT validation)', () => {
-  it('accepts a valid task block', () => {
+  it('accepts an autoUpdate block with enabled + time', () => {
+    expect(parseMaintenancePatch({ autoUpdate: { enabled: true, time: '04:00' } }))
+      .toEqual({ ok: true, patch: { autoUpdate: { enabled: true, time: '04:00' } } });
+  });
+  it('accepts an autoRestart toggle (enabled only; time ignored)', () => {
     expect(parseMaintenancePatch({ autoRestart: { enabled: true, time: '04:00' } }))
-      .toEqual({ ok: true, patch: { autoRestart: { enabled: true, time: '04:00' } } });
+      .toEqual({ ok: true, patch: { autoRestart: { enabled: true } } });
   });
-  it('accepts enabled-only (time optional)', () => {
-    expect(parseMaintenancePatch({ autoUpdate: { enabled: false } }))
-      .toEqual({ ok: true, patch: { autoUpdate: { enabled: false } } });
-  });
-  it('accepts both tasks at once', () => {
-    const r = parseMaintenancePatch({
+  it('accepts both at once', () => {
+    expect(parseMaintenancePatch({
       autoUpdate: { enabled: true, time: '04:00' },
-      autoRestart: { enabled: false, time: '05:30' },
-    });
-    expect(r).toEqual({ ok: true, patch: {
+      autoRestart: { enabled: false },
+    })).toEqual({ ok: true, patch: {
       autoUpdate: { enabled: true, time: '04:00' },
-      autoRestart: { enabled: false, time: '05:30' },
+      autoRestart: { enabled: false },
     } });
   });
-  it('rejects an invalid time', () => {
-    expect(parseMaintenancePatch({ autoRestart: { time: '99:99' } })).toEqual({ ok: false, error: 'invalid_time' });
+  it('rejects an invalid autoUpdate time', () => {
+    expect(parseMaintenancePatch({ autoUpdate: { time: '99:99' } })).toEqual({ ok: false, error: 'invalid_time' });
   });
-  it('rejects a non-boolean enabled', () => {
+  it('rejects a non-boolean enabled on either key', () => {
     expect(parseMaintenancePatch({ autoUpdate: { enabled: 'yes' } })).toEqual({ ok: false, error: 'invalid_enabled' });
+    expect(parseMaintenancePatch({ autoRestart: { enabled: 1 } })).toEqual({ ok: false, error: 'invalid_enabled' });
   });
   it('rejects a non-object task', () => {
     expect(parseMaintenancePatch({ autoRestart: 'x' })).toEqual({ ok: false, error: 'invalid_task' });

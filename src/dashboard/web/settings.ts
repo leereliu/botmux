@@ -44,20 +44,34 @@ function pageHtml(): string {
   </section>`;
 }
 
-function maintTaskRow(key: 'autoUpdate' | 'autoRestart', label: string, help: string, disabled: boolean): string {
-  const { enabled, time } = taskUi(settings!.maintenance, key);
+// Auto-update drives the schedule: toggle + a daily HH:MM time.
+function autoUpdateRow(disabled: boolean): string {
+  const { enabled, time } = taskUi(settings!.maintenance, 'autoUpdate');
   const dis = disabled ? 'disabled' : '';
   return `<label class="toggle-row">
-      <input type="checkbox" data-maint="${key}" ${enabled ? 'checked' : ''} ${dis}>
+      <input type="checkbox" data-maint="autoUpdate" ${enabled ? 'checked' : ''} ${dis}>
       <span class="switch" aria-hidden="true"></span>
-      <span class="toggle-tx"><strong>${label}</strong>
-      <small>${help}</small></span>
+      <span class="toggle-tx"><strong>${t('settings.autoUpdate')}</strong>
+      <small>${t('settings.autoUpdateHelp')}</small></span>
     </label>
     <div class="maint-time">
       <label>${t('settings.maintenanceTime')}
-        <input type="time" data-maint-time="${key}" value="${escapeHtml(time)}" ${dis}>
+        <input type="time" data-maint-time="autoUpdate" value="${escapeHtml(time)}" ${dis}>
       </label>
     </div>`;
+}
+
+// Auto-restart is a dependent toggle (no time of its own): restart to apply an
+// auto-update. Disabled unless auto-update is on.
+function autoRestartRow(disabled: boolean): string {
+  const enabled = settings!.maintenance.autoRestart?.enabled === true;
+  const dis = disabled ? 'disabled' : '';
+  return `<label class="toggle-row">
+      <input type="checkbox" data-maint="autoRestart" ${enabled ? 'checked' : ''} ${dis}>
+      <span class="switch" aria-hidden="true"></span>
+      <span class="toggle-tx"><strong>${t('settings.autoRestart')}</strong>
+      <small>${t('settings.autoRestartHelp')}</small></span>
+    </label>`;
 }
 
 function renderSettingsBody(): string {
@@ -90,9 +104,9 @@ function renderSettingsBody(): string {
       </section>
       <section class="bd-section">
         <h3 class="bd-section-title">${t('settings.sectionMaintenance')}</h3>
-        ${maintTaskRow('autoRestart', t('settings.autoRestart'), t('settings.autoRestartHelp'), !canWrite)}
-        ${maintTaskRow('autoUpdate', t('settings.autoUpdate'), t('settings.autoUpdateHelp'), updDisabled)}
+        ${autoUpdateRow(updDisabled)}
         ${settings.localDevInstall ? `<p class="hint-warn">${t('settings.autoUpdateLocalDev')}</p>` : ''}
+        ${autoRestartRow(!canWrite || settings.maintenance.autoUpdate?.enabled !== true)}
       </section>
       <div class="actions settings-actions">
         <span class="oncall-status" data-settings-status></span>
@@ -164,13 +178,18 @@ export async function renderSettingsPage(root: HTMLElement): Promise<void> {
         void putSettings({ [key]: input.checked }, () => { input.checked = before; }, input);
       });
     });
-    // Maintenance toggles + time inputs — always PUT the full task (enabled+time).
+    // Maintenance: auto-update sends {enabled,time}; auto-restart is a toggle ({enabled}).
     const sendMaint = (key: 'autoUpdate' | 'autoRestart', input: HTMLInputElement, revert: () => void) => {
       const toggle = bodyEl.querySelector<HTMLInputElement>(`input[data-maint="${key}"]`);
-      const timeEl = bodyEl.querySelector<HTMLInputElement>(`input[data-maint-time="${key}"]`);
       const enabled = toggle?.checked ?? false;
-      const time = timeEl?.value || '04:00';
-      void putSettings({ maintenance: { [key]: { enabled, time } } }, revert, input).then(() => rerender());
+      let task: { enabled: boolean; time?: string };
+      if (key === 'autoUpdate') {
+        const timeEl = bodyEl.querySelector<HTMLInputElement>('input[data-maint-time="autoUpdate"]');
+        task = { enabled, time: timeEl?.value || '04:00' };
+      } else {
+        task = { enabled };
+      }
+      void putSettings({ maintenance: { [key]: task } }, revert, input).then(() => rerender());
     };
     bodyEl.querySelectorAll<HTMLInputElement>('input[data-maint]').forEach(input => {
       input.addEventListener('change', () => {
