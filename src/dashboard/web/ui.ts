@@ -179,10 +179,12 @@ export function botOrbStyle(name: string): string {
 const botAvatarByAppId = new Map<string, string>();
 const botAvatarByName = new Map<string, string>();
 
-/** 查 bot 头像 URL：larkAppId 命中优先，再按 botName 兜底；都没有返回 undefined。 */
+/** 查 bot 头像 URL：larkAppId 是唯一稳定键，在场就只认它——绝不在 appId 落空时
+ *  串到 botName 兜底，否则两个同名 bot 会互相借用头像（按名查 last-writer-wins）。
+ *  只有完全没有 appId 的渲染点才退回按名查。 */
 export function botAvatarUrlFor(name?: string, larkAppId?: string): string | undefined {
-  return (larkAppId ? botAvatarByAppId.get(larkAppId) : undefined)
-    ?? (name ? botAvatarByName.get(String(name)) : undefined);
+  if (larkAppId) return botAvatarByAppId.get(larkAppId);
+  return name ? botAvatarByName.get(String(name)) : undefined;
 }
 
 export interface BotAvatarOpts {
