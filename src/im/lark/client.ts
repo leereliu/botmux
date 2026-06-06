@@ -56,6 +56,21 @@ export class MessageWithdrawnError extends Error {
   }
 }
 
+/**
+ * Thrown ONLY when a resource download genuinely needs (re-)authorization: no
+ * usable User Token on disk, or the User Token was rejected as unauthorized
+ * (HTTP 401). Callers gate the "/login" prompt on `instanceof` this — NOT on a
+ * substring of the message — so an ordinary download failure (4xx/5xx for a
+ * cross-tenant / card-image / withdrawn resource) is no longer misreported as
+ * "missing User Token, please /login" even though a valid token was used.
+ */
+export class UserTokenMissingError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'UserTokenMissingError';
+  }
+}
+
 /** Extract Lark error code from AxiosError or SDK error. */
 function getLarkErrorCode(err: any): number | undefined {
   return err?.response?.data?.code ?? err?.code;
@@ -591,7 +606,7 @@ export async function downloadMessageResource(larkAppId: string, messageId: stri
   const brand = normalizeBrand(bot.config.brand);
   const userToken = await resolveUserToken(bot.config.larkAppId, bot.config.larkAppSecret, brand);
   if (!userToken) {
-    throw new Error(
+    throw new UserTokenMissingError(
       `App Token 无法下载此资源，且未找到可用的 User Token。` +
       `请在话题中发送 /login 完成授权后重试。`
     );
@@ -623,7 +638,14 @@ async function downloadWithUserToken(userToken: string, messageId: string, fileK
   });
   if (!res.ok) {
     const body = await res.text().catch(() => '');
-    throw new Error(`User Token download failed: HTTP ${res.status} ${body}`);
+    // 401 = the token itself was rejected (expired / wrong scope) → genuinely
+    // needs re-login. Any other status (403/404/4xx/5xx) means the token is
+    // fine but THIS resource can't be fetched (cross-tenant, card image,
+    // withdrawn) — surface as a plain failure so it does NOT trigger /login.
+    if (res.status === 401) {
+      throw new UserTokenMissingError(`User Token 已失效（HTTP 401）。请在话题中发送 /login 重新授权后重试。`);
+    }
+    throw new Error(`Resource download failed: HTTP ${res.status} ${body}`);
   }
   const buf = Buffer.from(await res.arrayBuffer());
   writeFileSync(savePath, buf);
