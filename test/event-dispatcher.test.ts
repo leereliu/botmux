@@ -114,7 +114,7 @@ function setupBotState(opts?: {
   restrictGrantCommands?: boolean;
   regularGroupReplyInThread?: boolean;
   autoStartOnNewTopic?: boolean;
-  chatReplyModes?: Record<string, 'chat' | 'topic_alias'>;
+  chatReplyModes?: Record<string, 'chat' | 'new-topic' | 'topic_alias'>;
 }) {
   mockGetBot.mockReturnValue({
     config: {
@@ -1134,6 +1134,93 @@ describe('im.message.receive_v1 — regular group thread replies preference', ()
       larkAppId: MY_APP_ID,
     }));
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+});
+
+describe('im.message.receive_v1 — regular group reply mode (tri-state: chat | new-topic | topic_alias)', () => {
+  let handlers: ReturnType<typeof makeHandlers>;
+
+  beforeEach(() => {
+    capturedHandlers = {};
+    setupBotState();
+    handlers = makeHandlers();
+    mockFindOncallChat.mockReturnValue(undefined);
+    mockGetChatMode.mockResolvedValue('group');
+    mockGetCachedChatMode.mockReset();
+    mockGetCachedChatMode.mockReturnValue(undefined);
+    mockListChatBotMembers.mockResolvedValue([{ openId: MY_OPEN_ID, name: 'BotA' }]);
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+  });
+
+  it('per-chat new-topic forks a thread-scope session even when the per-bot default is off', async () => {
+    setupBotState({ chatReplyModes: { 'chat-tri-newtopic': 'new-topic' }, allowedUsers: [USER_OPEN_ID] });
+    handlers.isSessionOwner.mockReturnValue(false);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA open a focused topic' }),
+      messageId: 'msg-tri-newtopic',
+      chatId: 'chat-tri-newtopic',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'msg-tri-newtopic',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('per-chat topic_alias overrides a per-bot new-topic default — single mode, no competition', async () => {
+    // Per-bot default would fork a new topic; the per-chat topic_alias override
+    // must win and keep this turn on the chat-scope session (alias into thread).
+    setupBotState({ regularGroupReplyInThread: true, chatReplyModes: { 'chat-tri-alias': 'topic_alias' }, allowedUsers: [USER_OPEN_ID] });
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'chat-tri-alias');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA delegate but keep my session' }),
+      messageId: 'msg-tri-alias',
+      chatId: 'chat-tri-alias',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-tri-alias',
+      replyRootId: 'msg-tri-alias',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('per-chat chat opts out of a per-bot new-topic default — flat chat-scope, not a new topic', async () => {
+    setupBotState({ regularGroupReplyInThread: true, chatReplyModes: { 'chat-tri-flat': 'chat' }, allowedUsers: [USER_OPEN_ID] });
+    handlers.isSessionOwner.mockReturnValue(false);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA just answer here' }),
+      messageId: 'msg-tri-flat',
+      chatId: 'chat-tri-flat',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-tri-flat',
+      larkAppId: MY_APP_ID,
+    }));
   });
 });
 

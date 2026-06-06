@@ -7,7 +7,7 @@ import { isBotMentioned, canOperate, extractMessageTextForRouting } from './even
 import { stripLeadingMentions } from './message-parser.js';
 import { getChatMode, replyMessage } from './client.js';
 import { localeForBot, t } from '../../i18n/index.js';
-import { getChatReplyMode, normalizeChatReplyMode, setChatReplyMode } from '../../services/chat-reply-mode-store.js';
+import { normalizeChatReplyMode, replyModeLabel, resolveRegularGroupMode, setChatReplyMode } from '../../services/chat-reply-mode-store.js';
 import { logger } from '../../utils/logger.js';
 
 export async function tryHandleReplyModeCommand(
@@ -42,8 +42,8 @@ export async function tryHandleReplyModeCommand(
 
   if (isStatus) {
     if (!canTalk) return true;
-    const mode = getChatReplyMode(larkAppId, chatId);
-    await reply(t('cmd.reply_mode.status', { mode: mode === 'topic_alias' ? 'topic' : 'chat' }, loc));
+    const mode = resolveRegularGroupMode(larkAppId, chatId);
+    await reply(t('cmd.reply_mode.status', { mode: replyModeLabel(mode) }, loc));
     return true;
   }
 
@@ -61,6 +61,6 @@ export async function tryHandleReplyModeCommand(
     await reply(t('cmd.reply_mode.failed', { reason: res.reason }, loc));
     return true;
   }
-  await reply(t('cmd.reply_mode.updated', { mode: mode === 'topic_alias' ? 'topic' : 'chat' }, loc));
+  await reply(t('cmd.reply_mode.updated', { mode: replyModeLabel(mode) }, loc));
   return true;
 }

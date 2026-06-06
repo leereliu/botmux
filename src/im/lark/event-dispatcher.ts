@@ -24,7 +24,7 @@ import { openPending, isThrottled } from './grant-pending.js';
 import { localeForBot, t } from '../../i18n/index.js';
 import { chatQuotaKey, globalQuotaKey } from '../../services/grant-store.js';
 import { ensureDefaultOncallBound } from '../../services/oncall-store.js';
-import { getChatReplyMode } from '../../services/chat-reply-mode-store.js';
+import { resolveRegularGroupMode } from '../../services/chat-reply-mode-store.js';
 
 // ─── Bot identity ─────────────────────────────────────────────────────────
 
@@ -1023,7 +1023,7 @@ async function maybeApplyTopicAliasSeed(input: {
   const { larkAppId, chatId, chatType, message, senderOpenId, messageId, routing, forceTopicApplied } = input;
   if (forceTopicApplied) return undefined;
   if (chatType !== 'group') return undefined;
-  if (getChatReplyMode(larkAppId, chatId) !== 'topic_alias') return undefined;
+  if (resolveRegularGroupMode(larkAppId, chatId) !== 'topic_alias') return undefined;
   if (!isBotMentioned(larkAppId, message, senderOpenId)) return undefined;
   const freshMode = routing.scope === 'thread'
     ? await getChatMode(larkAppId, chatId, { forceRefresh: true })
@@ -1063,7 +1063,11 @@ type RoutingDecision = {
 };
 
 function regularGroupRouting(larkAppId: string, messageId: string, chatId: string): RoutingDecision {
-  if (getBot(larkAppId).config.regularGroupReplyInThread === true) {
+  // tri-state: only `new-topic` forks a fresh thread-scope session. `topic_alias`
+  // stays chat-scope here (the alias fold happens post-routing, see
+  // maybeApplyTopicAliasSeed); `chat` is the flat default. resolveRegularGroupMode
+  // is the single decision point so new-topic and topic_alias never both fire.
+  if (resolveRegularGroupMode(larkAppId, chatId) === 'new-topic') {
     return { scope: 'thread', anchor: messageId, source: 'regular-group-thread' };
   }
   return { scope: 'chat', anchor: chatId, source: 'regular-group-chat' };

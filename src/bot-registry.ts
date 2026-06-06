@@ -9,7 +9,7 @@ import { isLocale, setBotLookup, type Locale } from './i18n/index.js';
 import type { VoiceConfig } from './services/voice/types.js';
 import { type Brand, sdkDomain, normalizeBrand } from './im/lark/lark-hosts.js';
 
-export type ChatReplyMode = 'chat' | 'topic_alias';
+export type ChatReplyMode = 'chat' | 'new-topic' | 'topic_alias';
 
 export interface OncallChat {
   /** Lark chat_id (oc_xxx) the bot was pulled into. */
@@ -517,14 +517,15 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         .filter((x: any): x is string => typeof x === 'string');
     }
 
-    // chatReplyModes：只保留每群显式设置，非法值丢弃；`chat` 是默认值但保留解析，
-    // 写入路径会删除 chat 条目以保持 bots.json 干净。
+    // chatReplyModes：只保留每群显式设置，非法值丢弃。三态 chat｜new-topic｜
+    // topic_alias 都保留解析；写入路径会删除「与 per-bot 默认相同」的条目以保持
+    // bots.json 干净（见 chat-reply-mode-store.setChatReplyMode）。
     let chatReplyModes: { [chatId: string]: ChatReplyMode } | undefined;
     if (entry.chatReplyModes && typeof entry.chatReplyModes === 'object' && !Array.isArray(entry.chatReplyModes)) {
       const out: { [chatId: string]: ChatReplyMode } = {};
       for (const [cid, mode] of Object.entries(entry.chatReplyModes)) {
         if (typeof cid !== 'string' || !cid.trim()) continue;
-        if (mode === 'chat' || mode === 'topic_alias') out[cid] = mode;
+        if (mode === 'chat' || mode === 'new-topic' || mode === 'topic_alias') out[cid] = mode;
       }
       if (Object.keys(out).length > 0) chatReplyModes = out;
     }
