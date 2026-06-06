@@ -1,4 +1,4 @@
-# Lifecycle Hooks
+# 生命周期 Hooks
 
 botmux 可以在关键生命周期事件发生时**异步调用外部命令**。命令失败、超时或不存在只会写日志，不阻塞 botmux 主流程。
 

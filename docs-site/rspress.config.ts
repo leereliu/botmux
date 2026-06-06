@@ -21,7 +21,7 @@ export default defineConfig({
   search: { codeBlocks: true },
   markdown: { link: { checkDeadLinks: true } },
   builderConfig: {
-    output: { assetPrefix: "https://cdn.jsdelivr.net/gh/deepcoldy/botmux@docs-assets-v12/" },
+    output: { assetPrefix: "https://cdn.jsdelivr.net/gh/deepcoldy/botmux@docs-assets-v13/" },
   },
   themeConfig: {
     editLink: {
@@ -108,10 +108,6 @@ export default defineConfig({
                         "link": "/schedule"
                   },
                   {
-                        "text": "Lifecycle Hooks",
-                        "link": "/hooks"
-                  },
-                  {
                         "text": "Oncall 模式",
                         "link": "/oncall"
                   },
@@ -130,6 +126,10 @@ export default defineConfig({
                   {
                         "text": "Workflow（实验性）",
                         "link": "/workflow"
+                  },
+                  {
+                        "text": "生命周期 Hooks",
+                        "link": "/hooks"
                   },
                   {
                         "text": "Skill + CLI 交互",
