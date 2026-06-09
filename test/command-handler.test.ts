@@ -132,7 +132,7 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
   ),
   buildSlashListCard: vi.fn((params: any) => JSON.stringify(params)),
   buildRelayPickerCard: vi.fn(
-    (entries: any[], targetChatId: string, rootMessageId: string, _invokerOpenId?: string, _locale?: any, _state?: any, targetScope?: string) => JSON.stringify({
+    (entries: any[], targetChatId: string, rootMessageId: string, _invokerOpenId?: string, _locale?: any, _state?: any, targetScope?: string, targetChatType?: string) => JSON.stringify({
       schema: '2.0',
       body: {
         elements: entries.length === 0 ? [
@@ -141,7 +141,7 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
           tag: 'interactive_container',
           behaviors: [{
             type: 'callback',
-            value: { action: 'relay_select', session_id: e.sessionId, target_chat_id: targetChatId, root_id: rootMessageId, target_scope: targetScope ?? 'chat' },
+            value: { action: 'relay_select', session_id: e.sessionId, target_chat_id: targetChatId, root_id: rootMessageId, target_scope: targetScope ?? 'chat', target_chat_type: targetChatType ?? 'group' },
           }],
           elements: [{ tag: 'markdown', content: `**${e.title}**\n${e.chatMode ?? 'group'}\n${e.chatLabel}` }],
         })),
@@ -442,7 +442,7 @@ function mockCodexAppBot(): void {
 
 describe('DAEMON_COMMANDS set', () => {
   it('should contain all expected commands', () => {
-    const expected = ['/close', '/restart', '/status', '/help', '/cd', '/repo', '/schedule', '/role', '/botconfig', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/list-slash-command', '/slash'];
+    const expected = ['/close', '/restart', '/status', '/help', '/cd', '/repo', '/schedule', '/role', '/botconfig', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/list-slash-command', '/slash', '/land'];
     for (const cmd of expected) {
       expect(DAEMON_COMMANDS.has(cmd), `Expected DAEMON_COMMANDS to contain ${cmd}`).toBe(true);
     }
@@ -1904,21 +1904,76 @@ describe('handleCommand', () => {
       expect(card.body.elements.filter((e: any) => e.tag === 'interactive_container')).toHaveLength(0);
     });
 
-    it('picker refuses upfront in p2p chats (chatType local check)', async () => {
-      // p2p (1:1 with bot) has no relay concept; relay-picker entry refuses
-      // before rendering. Detection is via ds.chatType — no Lark API hit.
+    it('renders the picker in a thread-mode DM with a thread-scope target seeded on the /relay message', async () => {
+      // p2p detection is via ds.chatType (authoritative, no Lark API hit).
+      // Default DM mode is thread: the /relay message seeds a fresh DM 话题,
+      // so the baked target is thread-scope anchored at the message id.
+      const { getChatNameAndMode } = await import('../src/im/lark/client.js');
       const ds = makeDaemonSession({
         session: makeSession({ ownerOpenId: 'ou_sender', chatType: 'p2p' }),
         chatType: 'p2p',
       });
+      const otherDs: DaemonSession = {
+        ...makeDaemonSession(),
+        session: makeSession({
+          sessionId: 'sess-other',
+          chatId: 'oc_other',
+          rootMessageId: 'om_other_root',
+          title: 'other task',
+          ownerOpenId: 'ou_sender',
+        }),
+        chatId: 'oc_other',
+      };
       const deps = makeDeps(ds);
+      deps.activeSessions.set(sessionKey('om_other_root', LARK_APP_ID), otherDs);
 
       await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay'), deps, LARK_APP_ID);
 
-      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
-      expect(reply).toMatch(/单聊不支持|not supported in direct/);
-      // Picker MUST NOT have rendered.
-      expect(reply).not.toContain('选择要接力');
+      // p2p must NOT hit the chat-mode API (its failure default 'group' would
+      // misclassify the DM).
+      expect(vi.mocked(getChatNameAndMode)).not.toHaveBeenCalled();
+      const [, replyContent, msgType] = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0];
+      expect(msgType).toBe('interactive');
+      const card = JSON.parse(replyContent as string);
+      const containerValue = card.body.elements.find((e: any) => e.tag === 'interactive_container')?.behaviors?.[0]?.value;
+      expect(containerValue?.target_scope).toBe('thread');
+      expect(containerValue?.root_id).toBe('msg_001');
+      expect(containerValue?.target_chat_type).toBe('p2p');
+    });
+
+    it('renders the picker in a flat-mode DM (p2pMode chat) with a chat-scope target on the DM chatId', async () => {
+      vi.mocked(getBot).mockImplementation(((id: string = 'app-1') => {
+        const bot = defaultGetBot(id);
+        (bot.config as any).p2pMode = 'chat';
+        return bot;
+      }) as any);
+      const ds = makeDaemonSession({
+        session: makeSession({ ownerOpenId: 'ou_sender', chatType: 'p2p' }),
+        chatType: 'p2p',
+      });
+      const otherDs: DaemonSession = {
+        ...makeDaemonSession(),
+        session: makeSession({
+          sessionId: 'sess-other',
+          chatId: 'oc_other',
+          rootMessageId: 'om_other_root',
+          title: 'other task',
+          ownerOpenId: 'ou_sender',
+        }),
+        chatId: 'oc_other',
+      };
+      const deps = makeDeps(ds);
+      deps.activeSessions.set(sessionKey('om_other_root', LARK_APP_ID), otherDs);
+
+      await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay'), deps, LARK_APP_ID);
+
+      const [, replyContent, msgType] = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0];
+      expect(msgType).toBe('interactive');
+      const card = JSON.parse(replyContent as string);
+      const containerValue = card.body.elements.find((e: any) => e.tag === 'interactive_container')?.behaviors?.[0]?.value;
+      expect(containerValue?.target_scope).toBe('chat');
+      expect(containerValue?.root_id).toBe(CHAT_ID);
+      expect(containerValue?.target_chat_type).toBe('p2p');
     });
 
     it('renders the picker in topic chats with a thread-scope target (no longer refused)', async () => {

@@ -1339,6 +1339,12 @@ export function buildRelayPickerCard(
    *  (thread, reply_in_thread to `root_id`) or flat chat-scope. Default 'chat'
    *  preserves the legacy普通群-flat behavior. */
   targetScope: 'thread' | 'chat' = 'chat',
+  /** Target chat type baked into every button value so relay_confirm can pass
+   *  the right chatType to transferSession (a DM target must flip the session
+   *  to p2p, or post-relay inbound routing misclassifies it as a group).
+   *  Authoritative from the /relay command's session chatType. Default 'group'
+   *  covers legacy cards rendered before this field existed. */
+  targetChatType: 'group' | 'p2p' = 'group',
 ): string {
   const searchQuery = state?.searchQuery ?? '';
   const requestedPage = state?.page ?? 0;
@@ -1361,6 +1367,7 @@ export function buildRelayPickerCard(
     target_chat_id: targetChatId,
     root_id: targetRootMessageId,
     target_scope: targetScope,
+    target_chat_type: targetChatType,
     invoker_open_id: invokerOpenId,
     search: searchQuery,
     page,
@@ -1396,14 +1403,14 @@ export function buildRelayPickerCard(
   // ─── Empty / no-match notice ────────────────────────────────────────
   if (entries.length === 0) {
     elements.push({ tag: 'markdown', content: t('card.relay.empty', undefined, locale) });
-    return JSON.stringify(wrapCard(elements, locale));
+    return JSON.stringify(wrapCard(elements, locale, targetChatType));
   }
   if (filtered.length === 0) {
     elements.push({
       tag: 'markdown',
       content: t('card.relay.empty_filtered', { query: searchQuery }, locale),
     });
-    return JSON.stringify(wrapCard(elements, locale));
+    return JSON.stringify(wrapCard(elements, locale, targetChatType));
   }
 
   // ─── Session cards (current page) ───────────────────────────────────
@@ -1558,7 +1565,7 @@ export function buildRelayPickerCard(
           elements: [
             {
               tag: 'button',
-              text: { tag: 'plain_text', content: t('card.relay.btn_confirm', undefined, locale) },
+              text: { tag: 'plain_text', content: t(targetChatType === 'p2p' ? 'card.relay.btn_confirm_p2p' : 'card.relay.btn_confirm', undefined, locale) },
               type: 'primary',
               behaviors: [
                 {
@@ -1578,15 +1585,15 @@ export function buildRelayPickerCard(
     });
   }
 
-  return JSON.stringify(wrapCard(elements, locale));
+  return JSON.stringify(wrapCard(elements, locale, targetChatType));
 }
 
-function wrapCard(elements: any[], locale?: Locale): any {
+function wrapCard(elements: any[], locale?: Locale, targetChatType: 'group' | 'p2p' = 'group'): any {
   return {
     schema: '2.0',
     config: { update_multi: true },
     header: {
-      title: { tag: 'plain_text', content: t('card.relay.title', undefined, locale) },
+      title: { tag: 'plain_text', content: t(targetChatType === 'p2p' ? 'card.relay.title_p2p' : 'card.relay.title', undefined, locale) },
       template: 'blue',
     },
     body: { direction: 'vertical', elements },

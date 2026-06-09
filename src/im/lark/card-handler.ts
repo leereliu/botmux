@@ -319,8 +319,11 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const targetChatId = value.target_chat_id;
     const targetRootId = value.root_id;
     // root_id IS the relay target anchor (chatId for chat-scope, 话题 root for
-    // thread-scope). target_scope tells the confirm/re-render which it is.
+    // thread-scope). target_scope tells the confirm/re-render which it is;
+    // target_chat_type (group | p2p) rides along so confirm can flip the
+    // session's chatType for DM targets. Default 'group' covers legacy cards.
     const targetScope = (value.target_scope as 'thread' | 'chat') ?? 'chat';
+    const targetChatType = (value.target_chat_type as 'group' | 'p2p') ?? 'group';
     const invokerOpenId = value.invoker_open_id as string | undefined;
     if (!targetChatId || !targetRootId || !operatorOpenId) {
       return { toast: { type: 'error', content: t('card.relay.toast_failed', { error: 'missing_value' }, loc) } };
@@ -382,6 +385,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         page: nextPage,
       },
       targetScope,
+      targetChatType,
     );
     // Return an updated card body — event-dispatcher wraps this as
     // { card: { type: 'raw', data: <body> } } so Lark patches the picker
@@ -486,7 +490,11 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const targetRootId = value.root_id;
     // root_id IS the target anchor for thread-scope (the 话题 root); for chat-
     // scope the anchor is chatId and root_id is unused for routing.
+    // target_chat_type tells transferSession whether the destination is a DM
+    // (p2p) so the session's chatType flips with it; legacy cards lack the
+    // field and default to 'group' (their pickers never offered DM targets).
     const targetScope = (value.target_scope as 'thread' | 'chat') ?? 'chat';
+    const targetChatType = (value.target_chat_type as 'group' | 'p2p') ?? 'group';
     const targetAnchor = targetScope === 'chat' ? targetChatId : targetRootId;
     const invokerOpenId = value.invoker_open_id as string | undefined;
     if (!sourceSessionId || !targetChatId || !targetRootId) {
@@ -560,9 +568,13 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       return;
     }
     // Resolve a friendly source chat label for the M1 announcement — falls
-    // back to the raw chatId if Lark can't return a name.
+    // back to the raw chatId if Lark can't return a name. A p2p source has no
+    // chat name (chat.get often fails or returns empty for DMs) — use the
+    // locale-aware 单聊 label instead of leaking a raw oc_ id into the M1.
     const { getChatName } = await import('./client.js');
-    const sourceLabel = (await getChatName(larkAppId, sourceDs.chatId)) ?? sourceDs.chatId;
+    const sourceLabel = sourceDs.chatType === 'p2p'
+      ? t('card.relay.type_p2p', undefined, loc)
+      : (await getChatName(larkAppId, sourceDs.chatId)) ?? sourceDs.chatId;
     // Send the M1 announcement.
     //   chat-scope: a plain top-level message; its id becomes the (audit-only)
     //               rootMessageId after the transfer (mirrors /relay --create).
@@ -571,7 +583,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     //               话题 root (targetAnchor), NOT the M1 id.
     let m1MessageId: string;
     try {
-      const m1Text = t('cmd.relay.m1_announce', { sourceChat: sourceLabel, groupName: targetChatId }, loc);
+      const m1Text = t(targetChatType === 'p2p' ? 'cmd.relay.m1_announce_dm' : 'cmd.relay.m1_announce', { sourceChat: sourceLabel, groupName: targetChatId }, loc);
       m1MessageId = targetScope === 'thread'
         ? await replyMessage(larkAppId, targetAnchor, m1Text, 'text', /*replyInThread*/ true)
         : await sendMessage(larkAppId, targetChatId, m1Text, 'text');
@@ -582,8 +594,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     // chat-scope → anchor on the M1 id (audit-only); thread-scope → anchor on
     // the 话题 root (targetAnchor) so future replies in the 话题 route here.
     const r = targetScope === 'thread'
-      ? await transferSession(sourceDs.session.sessionId, targetChatId, targetAnchor, 'group', 'thread')
-      : await transferSession(sourceDs.session.sessionId, targetChatId, m1MessageId, 'group', 'chat');
+      ? await transferSession(sourceDs.session.sessionId, targetChatId, targetAnchor, targetChatType, 'thread')
+      : await transferSession(sourceDs.session.sessionId, targetChatId, m1MessageId, targetChatType, 'chat');
     if (!r.ok) {
       // Best-effort: orphan M1 cleanup so a failed transfer doesn't leave a
       // misleading "已接力" message in the target chat (王皓's "明明失败了

@@ -1055,15 +1055,20 @@ export async function transferSession(
   targetChatId: string,
   targetRootMessageId: string,
   /**
-   * Target chat type — narrowed to `'group'` at the type level. The picker-
-   * mode entry guard in command-handler.ts refuses p2p chats upfront; topic
-   * groups are supported via `targetScope: 'thread'`. `/relay --create` builds
-   * the target by createGroupWithBots so it's a regular group by construction;
-   * the cross-daemon migrate-to-chat IPC inherits the same target. Every call
-   * site can vouch — TS prevents any non-'group' literal from reaching here,
-   * and the runtime check just below catches mock data / future bypasses.
+   * Target chat type.
+   *   'group' → topic groups are supported via `targetScope: 'thread'`;
+   *             `/relay --create` builds the target by createGroupWithBots so
+   *             it's a regular group by construction; the cross-daemon
+   *             migrate-to-chat IPC inherits the same target.
+   *   'p2p'   → the bot's DM. Flat DMs (p2pMode 'chat') land chat-scope on the
+   *             chatId anchor; thread-mode DMs land thread-scope on a DM 话题
+   *             root. The session's chatType flips with the move so post-relay
+   *             inbound routing / picker labels / reply targeting treat it as
+   *             a DM. Carried from the picker card's `target_chat_type`.
+   * The runtime check just below catches raw-string casting at module
+   * boundaries (mocks, HTTP body parses, future bypasses).
    */
-  targetChatType: 'group',
+  targetChatType: 'group' | 'p2p',
   /**
    * Target routing scope for the relayed session.
    *   'chat'   → anchor = chatId (flat top-level; `/relay --create`, migrate
@@ -1085,7 +1090,7 @@ export async function transferSession(
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   // Depth defense — unreachable per TS narrowing above, but guards against
   // raw-string casting at module boundaries (mocks, HTTP body parses, etc.).
-  if ((targetChatType as string) !== 'group') {
+  if ((targetChatType as string) !== 'group' && (targetChatType as string) !== 'p2p') {
     return { ok: false, error: 'target_chat_type_unsupported' };
   }
   const ds = findActiveBySessionId(sessionId);

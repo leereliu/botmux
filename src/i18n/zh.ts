@@ -140,9 +140,11 @@ export const messages: Record<string, string> = {
 
   // ─── /relay picker card (pull mode) ─────────────────────────────────────
   'card.relay.title': '📋 选择要接力到本群的会话',
+  'card.relay.title_p2p': '📋 选择要接力到本单聊的会话',
   'card.relay.empty': '当前没有可接力的会话。\n（picker 只列你作为 owner、同一机器人在其他群里的活跃会话。）',
   'card.relay.btn_pull': '接力到本群',
   'card.relay.btn_confirm': '确认接力到本群',
+  'card.relay.btn_confirm_p2p': '确认接力到本单聊',
   'card.relay.btn_confirm_running': '会话运行中，暂不可迁移',
   'card.relay.field_status': '状态',
   'card.relay.status_running': '🟢 运行中',
@@ -331,9 +333,9 @@ export const messages: Record<string, string> = {
   'cmd.relay.adopt_not_relayable': '⚠️ 该会话是 /adopt 接入的外部 tmux 进程，CLI 在你电脑里跑，botmux 控不了 tmux 生命周期，无法接力。',
   'cmd.relay.not_started_yet': '⚠️ 会话还没选仓库、CLI 没起来，无法接力。请先在本会话里选仓库把 CLI 起起来。',
   'cmd.relay.worker_busy': '⚠️ 会话正在处理中（mid-turn），无法接力。请等当前回合结束（idle）后再发 /relay。',
-  'cmd.relay.picker_p2p_unsupported': '⚠️ 单聊不支持接力会话。请在群里使用 /relay。',
   'cmd.relay.resolve_failed': '⚠️ 无法解析被 @ 的机器人，/relay 取消。请稍后重试。',
   'cmd.relay.m1_announce': '📋 已从「{sourceChat}」接力会话过来。\n⚠️ 飞书消息历史留在源群，AI 记忆已接续。\n@ 对应机器人继续对话即可。',
+  'cmd.relay.m1_announce_dm': '📋 已从「{sourceChat}」接力会话过来。\n⚠️ 飞书消息历史留在源会话，AI 记忆已接续。\n直接发消息继续对话即可。',
   'cmd.relay.m1_final_all_ok': '🚀 会话已接力到本群\n📋 来源：{sourceChat}\n✅ 已就绪：{successBots}\n⚠️ 飞书消息历史留在源群，AI 记忆已接续。@ 对应机器人继续对话。',
   'cmd.relay.m1_final_partial': '🚀 会话已接力到本群\n📋 来源：{sourceChat}\n✅ 已就绪：{successBots}\n⚠️ 未能迁移：{failedBots}\n→ 请在本群发 /relay，从菜单里把上述 bot 在源群的会话拉过来\n⚠️ 飞书消息历史留在源群，AI 记忆已接续。',
   'cmd.relay.m1_final_all_fresh': '🚀 新群已建好，机器人都已邀请。\n📋 来源：{sourceChat}\n本次没有可迁移的源会话——@ 任意机器人开始新对话即可。',

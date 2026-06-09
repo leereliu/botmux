@@ -1586,31 +1586,31 @@ export async function handleCommand(
             await sessionReply(rootId, t('cmd.relay.no_session', undefined, loc));
             break;
           }
-          // ── Chat-type guard + target-routing resolution ───────────────────
-          // p2p (1:1 with bot) has no relay target — there's no other
-          // participant. For group chats we resolve the chat mode (话题群 vs
-          // 普通群) once, then compute WHERE the relayed session should land via
-          // resolveRelayTargetRouting (mirrors decideRouting; 话题群 / 线程内 /
-          // 普通群 new-topic·shared → thread-scope, 普通群 flat → chat-scope).
-          // p2p is also detectable from `ds.chatType` locally (cheap); the API
-          // resolves topic-vs-regular (both record chatType 'group').
-          if (ds?.chatType === 'p2p') {
-            await sessionReply(rootId, t('cmd.relay.picker_p2p_unsupported', undefined, loc));
-            break;
+          // ── Target-routing resolution ─────────────────────────────────────
+          // Resolve the chat mode once, then compute WHERE the relayed session
+          // should land via resolveRelayTargetRouting (mirrors decideRouting;
+          // 话题群 / 线程内 / 普通群 new-topic·shared → thread-scope, 普通群
+          // flat → chat-scope; DM 扁平(p2pMode chat) → chat-scope, DM 话题模式
+          // → thread-scope seeded on the /relay message).
+          // p2p is authoritative from `ds.chatType` (recorded off the Lark
+          // event payload — doesn't drift, and the API's safe-default 'group'
+          // on failure would misclassify a DM); only group chats need the API
+          // call to split topic-vs-regular (both record chatType 'group').
+          const targetIsP2p = ds?.chatType === 'p2p';
+          const targetChatType: 'group' | 'p2p' = targetIsP2p ? 'p2p' : 'group';
+          let targetChatMode: 'group' | 'topic' | 'p2p' = 'p2p';
+          if (!targetIsP2p) {
+            const { getChatNameAndMode } = await import('../im/lark/client.js');
+            const info = await getChatNameAndMode(myAppId, targetChatId).catch(() => null);
+            targetChatMode = info?.mode ?? 'group';
           }
-          const { getChatNameAndMode } = await import('../im/lark/client.js');
-          const info = await getChatNameAndMode(myAppId, targetChatId).catch(() => null);
           const { resolveRelayTargetRouting } = await import('../im/lark/relay-target-routing.js');
           const targetRouting = resolveRelayTargetRouting({
             larkAppId: myAppId,
             chatId: targetChatId,
             message: { messageId: message.messageId, rootId: message.rootId || undefined, threadId: message.threadId },
-            chatMode: info?.mode ?? 'group',
+            chatMode: targetChatMode,
           });
-          if ('reject' in targetRouting) {
-            await sessionReply(rootId, t('cmd.relay.picker_p2p_unsupported', undefined, loc));
-            break;
-          }
           const targetScope = targetRouting.scope;
           const targetAnchor = targetRouting.anchor;
           // ── Existing-session guard (anchor-based) ─────────────────────────
@@ -1639,7 +1639,7 @@ export async function handleCommand(
           const { collectRelayPickerEntries } = await import('../services/relay-picker.js');
           const entries = await collectRelayPickerEntries(activeSessions, myAppId, targetAnchor, operatorOpenId);
           const { buildRelayPickerCard } = await import('../im/lark/card-builder.js');
-          const card = buildRelayPickerCard(entries, targetChatId, targetAnchor, operatorOpenId, loc, undefined, targetScope);
+          const card = buildRelayPickerCard(entries, targetChatId, targetAnchor, operatorOpenId, loc, undefined, targetScope, targetChatType);
           await sessionReply(rootId, card, 'interactive');
           break;
         }

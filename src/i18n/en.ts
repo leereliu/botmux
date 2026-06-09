@@ -137,9 +137,11 @@ export const messages: Record<string, string> = {
 
   // ─── /relay picker card (pull mode) ─────────────────────────────────────
   'card.relay.title': '📋 Pick a session to relay into this chat',
+  'card.relay.title_p2p': '📋 Pick a session to relay into this DM',
   'card.relay.empty': 'No relayable sessions.\n(Picker only lists sessions you own, on this bot, in other chats.)',
   'card.relay.btn_pull': 'Pull into this chat',
   'card.relay.btn_confirm': 'Confirm relay into this chat',
+  'card.relay.btn_confirm_p2p': 'Confirm relay into this DM',
   'card.relay.btn_confirm_running': 'Session is running — cannot relay yet',
   'card.relay.field_status': 'Status',
   'card.relay.status_running': '🟢 Running',
@@ -328,9 +330,9 @@ export const messages: Record<string, string> = {
   'cmd.relay.adopt_not_relayable': '⚠️ This session was attached via /adopt to an external tmux. The CLI runs on your machine and botmux does not control its tmux lifecycle, so it cannot be relayed.',
   'cmd.relay.not_started_yet': '⚠️ The session has not picked a repo and the CLI has never started — nothing to relay yet. Pick a repo in this session first.',
   'cmd.relay.worker_busy': '⚠️ The session is mid-turn (working). Wait for the current turn to finish (idle), then try /relay again.',
-  'cmd.relay.picker_p2p_unsupported': '⚠️ Relay is not supported in direct (p2p) chats. Use /relay in a group chat.',
   'cmd.relay.resolve_failed': '⚠️ Could not resolve the @-mentioned bots; /relay cancelled. Please retry shortly.',
   'cmd.relay.m1_announce': '📋 Relayed from "{sourceChat}".\n⚠️ Lark message history stays in the source chat; AI memory has been carried over.\n@ the corresponding bot to continue.',
+  'cmd.relay.m1_announce_dm': '📋 Relayed from "{sourceChat}".\n⚠️ Lark message history stays in the source chat; AI memory has been carried over.\nJust send a message to continue.',
   'cmd.relay.m1_final_all_ok': '🚀 Sessions relayed into this chat\n📋 Source: {sourceChat}\n✅ Ready: {successBots}\n⚠️ Lark message history stays in the source chat; AI memory has been carried over. @ the corresponding bot to continue.',
   'cmd.relay.m1_final_partial': '🚀 Sessions relayed into this chat\n📋 Source: {sourceChat}\n✅ Ready: {successBots}\n⚠️ Failed to migrate: {failedBots}\n→ Run /relay in this chat to pull those bots\' sessions from the source manually.\n⚠️ Lark message history stays in the source chat; AI memory has been carried over.',
   'cmd.relay.m1_final_all_fresh': '🚀 New group created and bots invited.\n📋 Source: {sourceChat}\nNo source session to migrate — @ any bot to start a fresh conversation.',
