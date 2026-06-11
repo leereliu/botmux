@@ -55,7 +55,8 @@ import {
   type SessionRow,
 } from './dashboard-rows.js';
 import { getBotBrand, getBot } from '../bot-registry.js';
-import type { ScheduledTask, ParsedSchedule } from '../types.js';
+import { normalizeKanbanColumn, normalizeKanbanPosition, normalizeSessionTitle } from './session-board.js';
+import type { ScheduledTask, ParsedSchedule, Session } from '../types.js';
 
 export interface IpcServerHandle {
   port: number;
@@ -174,6 +175,53 @@ ipcRoute('GET', '/api/sessions/:sessionId', (_req, res, params) => {
 ipcRoute('POST', '/api/sessions/:sessionId/close', async (_req, res, params) => {
   const r = await closeSession(params.sessionId);
   jsonRes(res, 200, r);
+});
+
+/** 解析 session（活跃优先，已关闭兜底）。活跃会话取 ds.session —— registry 与
+ *  store 持有同一对象，改字段后 updateSession 即落盘。 */
+function findSessionRecord(sessionId: string): Session | undefined {
+  return findActiveBySessionId(sessionId)?.session ?? sessionStore.getSession(sessionId);
+}
+
+// 看板放置：dashboard 看板视图拖拽卡片后持久化列 + 列内排序位置。
+// 改完广播 session.update，所有打开的 dashboard 实时同步。
+ipcRoute('POST', '/api/sessions/:sessionId/board', async (req, res, params) => {
+  let body: { column?: unknown; position?: unknown };
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const column = normalizeKanbanColumn(body.column);
+  const position = normalizeKanbanPosition(body.position);
+  if (!column && position === null) return jsonRes(res, 400, { ok: false, error: 'bad_request' });
+  const session = findSessionRecord(params.sessionId);
+  if (!session) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  if (column) session.kanbanColumn = column;
+  if (position !== null) session.kanbanPosition = position;
+  sessionStore.updateSession(session);
+  dashboardEventBus.publish({
+    type: 'session.update',
+    body: {
+      sessionId: params.sessionId,
+      patch: { kanbanColumn: session.kanbanColumn, kanbanPosition: session.kanbanPosition },
+    },
+  });
+  jsonRes(res, 200, { ok: true });
+});
+
+// 会话重命名：dashboard 看板卡片就地编辑标题。title 只是展示元数据（飞书话题
+// 标题不受影响），但全视图（看板/状态板/表格/抽屉）读同一字段，改一处全变。
+ipcRoute('POST', '/api/sessions/:sessionId/rename', async (req, res, params) => {
+  let body: { title?: unknown };
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const title = normalizeSessionTitle(body.title);
+  if (!title) return jsonRes(res, 400, { ok: false, error: 'bad_title' });
+  const session = findSessionRecord(params.sessionId);
+  if (!session) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  session.title = title;
+  sessionStore.updateSession(session);
+  dashboardEventBus.publish({
+    type: 'session.update',
+    body: { sessionId: params.sessionId, patch: { title } },
+  });
+  jsonRes(res, 200, { ok: true, title });
 });
 
 /**

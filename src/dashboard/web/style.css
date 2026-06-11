@@ -1197,11 +1197,24 @@ button.primary {
   font-variant-numeric: tabular-nums;
 }
 
-.kanban-needs-you .kanban-col-icon { color: var(--danger); }
-.kanban-starting .kanban-col-icon { color: var(--warning); }
-.kanban-working .kanban-col-icon { color: var(--success); }
-.kanban-idle .kanban-col-icon { color: var(--faint); }
-.kanban-closed .kanban-col-icon { color: var(--accent); }
+.kanban-backlog .kanban-col-icon { color: var(--faint); }
+.kanban-todo .kanban-col-icon { color: var(--muted); }
+.kanban-in_progress .kanban-col-icon { color: var(--warning); }
+.kanban-in_review .kanban-col-icon { color: var(--success); }
+.kanban-done .kanban-col-icon { color: var(--accent); }
+
+/* 拖拽视觉：目标列描边、插入位置在目标卡上沿画一条插入线、拖拽源半透明 */
+.kanban-column.drag-over {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+}
+
+.kanban-card.dragging {
+  opacity: 0.45;
+}
+
+.kanban-card.drop-before {
+  box-shadow: 0 -2px 0 0 var(--accent);
+}
 
 .kanban-col-list {
   flex: 1;
@@ -1260,20 +1273,74 @@ button.primary {
   color: var(--muted);
   font-family: var(--mono);
   font-size: 11px;
+  white-space: nowrap;
 }
 
-/* 「详情」按钮平时隐身，悬停/聚焦卡片才浮现——保持卡面与 multica 一样干净 */
-.kanban-card-details {
+/* CLI 徽章别折行（claude-code 之类带连字符的会被 280px 卡片拆成两行） */
+.kanban-card-top .badge {
+  white-space: nowrap;
+  flex: none;
+}
+
+/* 右上角动作区：运行状态点常显；重命名/详情按钮平时隐身，悬停/聚焦才浮现 */
+.kanban-card-top-right {
   margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.kanban-card-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--faint);
+  flex: none;
+}
+
+.kanban-card-dot[data-status="working"],
+.kanban-card-dot[data-status="analyzing"],
+.kanban-card-dot[data-status="active"] {
+  background: var(--success);
+}
+
+.kanban-card-dot[data-status="starting"] {
+  background: var(--warning);
+}
+
+.kanban-card-dot[data-status="limited"] {
+  background: var(--danger);
+}
+
+.kanban-card-dot[data-status="closed"] {
+  background: var(--border);
+}
+
+.kanban-card-act {
   width: 24px;
   height: 24px;
   min-height: 24px;
   opacity: 0;
 }
 
-.kanban-card:hover .kanban-card-details,
-.kanban-card:focus-within .kanban-card-details {
+.kanban-card:hover .kanban-card-act,
+.kanban-card:focus-within .kanban-card-act {
   opacity: 1;
+}
+
+/* 标题就地编辑输入框：占标题原位，不撑破卡片 */
+.kanban-rename-input {
+  width: 100%;
+  min-width: 0;
+  margin: 0;
+  padding: 2px 6px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--fg);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.45;
 }
 
 .kanban-card-title {

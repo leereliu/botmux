@@ -7,6 +7,12 @@ import {
   writeStoredBoardOrder,
   writeStoredSessionsViewMode,
 } from './preferences.js';
+import {
+  computeDropPosition,
+  deriveKanbanColumn,
+  effectiveKanbanPosition,
+  type SessionKanbanColumn,
+} from './kanban-model.js';
 import { store } from './store.js';
 import {
   botDisplayName,
@@ -62,36 +68,36 @@ const BOARD_COLUMNS: Array<{ id: BoardColumnId; labelKey: string; hintKey: strin
   { id: 'idle', labelKey: 'sessions.board.idle', hintKey: 'sessions.board.idleHint' },
 ];
 
-// ── 看板视图（multica Issues 风格）────────────────────────────────────────────
-// 在状态板四列之外多一个「已关闭」列（multica 的 Done 位）；列固定顺序、横向滚动。
-type KanbanColumnId = BoardColumnId | 'closed';
-
-const KANBAN_COLUMNS: Array<{ id: KanbanColumnId; labelKey: string }> = [
-  { id: 'needs-you', labelKey: 'sessions.board.needsYou' },
-  { id: 'starting', labelKey: 'sessions.board.starting' },
-  { id: 'working', labelKey: 'sessions.board.working' },
-  { id: 'idle', labelKey: 'sessions.board.idle' },
-  { id: 'closed', labelKey: 'sessions.kanban.closed' },
+// ── 看板视图 ──────────────────────────────────────────────────────────────────
+// 五列手动工作流（待办池/待办/进行中/待确认/已完成）：卡片可拖拽换列与列内排序，
+// 放置持久化在 Session 上（daemon /board 端点）；未手动放置的会话按运行状态
+// 推导默认列（kanban-model.ts），已关闭会话固定落「已完成」。
+const KANBAN_COLUMNS: Array<{ id: SessionKanbanColumn; labelKey: string }> = [
+  { id: 'backlog', labelKey: 'sessions.kanban.backlog' },
+  { id: 'todo', labelKey: 'sessions.kanban.todo' },
+  { id: 'in_progress', labelKey: 'sessions.kanban.inProgress' },
+  { id: 'in_review', labelKey: 'sessions.kanban.inReview' },
+  { id: 'done', labelKey: 'sessions.kanban.done' },
 ];
 
-// 已关闭会话可能积累上千条——看板里只展示最近的一截，剩余以计数提示。
-const KANBAN_CLOSED_CAP = 50;
+// 「已完成」列收纳所有已关闭会话，可能积累上千条——只展示最前的一截，剩余计数提示。
+const KANBAN_DONE_CAP = 50;
 
-// multica 风格的列状态图标：14x14 SVG，圆环 + 不同填充度的扇形/对勾，
+// 列状态图标：14x14 SVG，圆环 + 不同填充度的扇形/对勾表达工作流进度，
 // 颜色由列容器的 currentColor 决定（CSS 里按列着色）。
-function kanbanStatusIcon(id: KanbanColumnId): string {
+function kanbanStatusIcon(id: SessionKanbanColumn): string {
   const ring = (extra = '') =>
     `<svg viewBox="0 0 14 14" aria-hidden="true"><circle cx="7" cy="7" r="5.4" fill="none" stroke="currentColor" stroke-width="1.6"${extra}/>`;
   switch (id) {
-    case 'starting': // 虚线圆环（multica Backlog 位）
+    case 'backlog': // 虚线圆环
       return `${ring(' stroke-dasharray="1.6 2.1"')}</svg>`;
-    case 'working': // 半圆填充（multica In Progress 位）
+    case 'in_progress': // 半圆填充
       return `${ring()}<path d="M7,7 L7,3.6 A3.4,3.4 0 0 1 7,10.4 Z" fill="currentColor"/></svg>`;
-    case 'needs-you': // 3/4 填充（multica In Review 位）
+    case 'in_review': // 3/4 填充
       return `${ring()}<path d="M7,7 L7,3.6 A3.4,3.4 0 1 1 3.6,7 Z" fill="currentColor"/></svg>`;
-    case 'closed': // 实心圆 + 对勾（multica Done 位）
+    case 'done': // 实心圆 + 对勾
       return `<svg viewBox="0 0 14 14" aria-hidden="true"><circle cx="7" cy="7" r="6.2" fill="currentColor"/><path d="M4.4 7.2 6.2 9 9.7 5.4" fill="none" stroke="var(--surface)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
-    case 'idle': // 空心圆环（multica Todo 位）
+    case 'todo': // 空心圆环
     default:
       return `${ring()}</svg>`;
   }
@@ -127,6 +133,7 @@ const ICON = {
   terminal: '<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="1.7" y="2.7" width="12.6" height="10.6" rx="2"/><path d="M4.4 6.3 6.4 8.1 4.4 9.9"/><path d="M8.2 10.2h3.4"/></svg>',
   key: '<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="6" cy="6.1" r="3"/><path d="M8.1 8.2 13 13.1"/><path d="M11.3 11.4 12.6 10.1"/><path d="M12.7 12.8 13.7 11.8"/></svg>',
   close: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4.2 4.2 11.8 11.8"/><path d="M11.8 4.2 4.2 11.8"/></svg>',
+  edit: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10.7 3.3 12.7 5.3 6.3 11.7 3.7 12.3 4.3 9.7 10.7 3.3z"/></svg>',
 };
 
 /** Compact icon action button for the card bar. `kind` adds a tint variant. */
@@ -284,6 +291,14 @@ export function renderSessionsPage(root: HTMLElement) {
   let lastTableHtml = '';
   let lastKanbanHtml = '';
   let boardAnimated = false;
+  // 看板交互态：拖拽中的卡片 id / 标题就地编辑中 —— 两者期间都跳过看板重绘，
+  // 否则 SSE 触发的 innerHTML 重建会把拖拽源/输入框拍没。
+  let kanbanDragId: string | null = null;
+  let kanbanEditing = false;
+  // 单击开终端 vs 双击改标题的仲裁：单击延迟 220ms 执行，双击先到就取消。
+  let kanbanOpenTimer: ReturnType<typeof setTimeout> | null = null;
+  // 上次渲染时每列的有序行 —— drop 落点据此找相邻卡片算持久化位置。
+  let lastKanbanGroups = new Map<SessionKanbanColumn, any[]>();
 
   function orderedBoardColumns() {
     return boardOrder
@@ -440,8 +455,9 @@ export function renderSessionsPage(root: HTMLElement) {
     boardAnimated = true;
   }
 
-  // ── 看板视图（multica Issues 风格卡片）────────────────────────────────────
-  // 卡片整体即点击目标：点开页面内终端弹窗；右上角「详情」进抽屉。
+  // ── 看板视图卡片 ─────────────────────────────────────────────────────────
+  // 卡片整体即点击目标：单击开页面内终端弹窗；铅笔改标题；「详情」进抽屉；
+  // 整卡可拖拽换列/排序。
   function kanbanCardHtml(s: any): string {
     const title = stripMentionPrefix(s.title) || s.sessionId;
     const botName = botDisplayName(s);
@@ -449,12 +465,17 @@ export function renderSessionsPage(root: HTMLElement) {
     const repo = repoBasename(s.workingDir);
     const signal = boardSignalLabel(s);
     const desc = [chatTitle, repo !== '-' ? repo : null].filter(Boolean).join(' · ');
-    return `<article class="kanban-card" data-id="${escapeHtml(s.sessionId)}" tabindex="0" role="button">
+    const status = String(s.status ?? 'unknown');
+    return `<article class="kanban-card" data-id="${escapeHtml(s.sessionId)}" tabindex="0" role="button" draggable="true">
       <div class="kanban-card-top">
         <span class="badge cli-${cssToken(s.cliId)}">${escapeHtml(s.cliId ?? 'unknown')}</span>
         <span class="kanban-card-id" title="${escapeHtml(s.sessionId)}">#${escapeHtml(String(s.sessionId).slice(0, 8))}</span>
         ${s.adopt ? '<span class="badge">adopt</span>' : ''}
-        <button type="button" class="card-act kanban-card-details" data-action="details" title="${escapeHtml(t('sessions.details'))}" aria-label="${escapeHtml(t('sessions.details'))}">${ICON.details}</button>
+        <span class="kanban-card-top-right">
+          <span class="kanban-card-dot" data-status="${escapeHtml(status)}" title="${escapeHtml(status)}"></span>
+          <button type="button" class="card-act kanban-card-act" data-action="rename" title="${escapeHtml(t('sessions.kanban.rename'))}" aria-label="${escapeHtml(t('sessions.kanban.rename'))}">${ICON.edit}</button>
+          <button type="button" class="card-act kanban-card-act" data-action="details" title="${escapeHtml(t('sessions.details'))}" aria-label="${escapeHtml(t('sessions.details'))}">${ICON.details}</button>
+        </span>
       </div>
       <p class="kanban-card-title" title="${escapeHtml(String(s.title ?? title))}">${escapeHtml(String(title).slice(0, 140))}</p>
       ${desc ? `<p class="kanban-card-desc" title="${escapeHtml(desc)}">${escapeHtml(desc)}</p>` : ''}
@@ -467,24 +488,19 @@ export function renderSessionsPage(root: HTMLElement) {
   }
 
   function renderKanban(rows: any[]): void {
-    const groups = new Map<KanbanColumnId, any[]>(KANBAN_COLUMNS.map(c => [c.id, []]));
-    for (const row of rows) {
-      const column: KanbanColumnId | null = row.status === 'closed' ? 'closed' : deriveSessionBoardColumn(row);
-      if (column) groups.get(column)!.push(row);
-    }
+    // 拖拽/编辑期间冻结 DOM —— innerHTML 重建会拍掉拖拽源和输入框。
+    if (kanbanDragId || kanbanEditing) return;
+    const groups = new Map<SessionKanbanColumn, any[]>(KANBAN_COLUMNS.map(c => [c.id, []]));
+    for (const row of rows) groups.get(deriveKanbanColumn(row))!.push(row);
     const html = KANBAN_COLUMNS.map(column => {
-      let columnRows = groups.get(column.id) ?? [];
+      let columnRows = (groups.get(column.id) ?? [])
+        .sort((a, b) => effectiveKanbanPosition(a) - effectiveKanbanPosition(b));
       let hiddenCount = 0;
-      if (column.id === 'closed') {
-        columnRows.sort((a, b) =>
-          Number(b.closedAt ?? b.lastMessageAt ?? 0) - Number(a.closedAt ?? a.lastMessageAt ?? 0));
-        if (columnRows.length > KANBAN_CLOSED_CAP) {
-          hiddenCount = columnRows.length - KANBAN_CLOSED_CAP;
-          columnRows = columnRows.slice(0, KANBAN_CLOSED_CAP);
-        }
-      } else {
-        columnRows.sort((a, b) => compareBoardRows(a, b, column.id as BoardColumnId));
+      if (column.id === 'done' && columnRows.length > KANBAN_DONE_CAP) {
+        hiddenCount = columnRows.length - KANBAN_DONE_CAP;
+        columnRows = columnRows.slice(0, KANBAN_DONE_CAP);
       }
+      groups.set(column.id, columnRows);
       return `<section class="kanban-column kanban-${column.id}" data-col="${column.id}">
         <header>
           <span class="kanban-col-icon">${kanbanStatusIcon(column.id)}</span>
@@ -493,13 +509,120 @@ export function renderSessionsPage(root: HTMLElement) {
         </header>
         <div class="kanban-col-list">
           ${columnRows.length ? columnRows.map(kanbanCardHtml).join('') : `<div class="kanban-col-empty">${t('sessions.board.emptyColumn')}</div>`}
-          ${hiddenCount ? `<div class="kanban-col-more">${escapeHtml(t('sessions.kanban.moreClosed', { count: hiddenCount }))}</div>` : ''}
+          ${hiddenCount ? `<div class="kanban-col-more">${escapeHtml(t('sessions.kanban.moreHidden', { count: hiddenCount }))}</div>` : ''}
         </div>
       </section>`;
     }).join('');
+    lastKanbanGroups = groups;
     if (html === lastKanbanHtml) return;
     lastKanbanHtml = html;
     kanban.innerHTML = html;
+  }
+
+  // ── 看板写操作：拖拽放置 / 重命名（乐观更新 + 失败回滚）────────────────────
+  async function persistBoardMove(
+    s: any,
+    column: SessionKanbanColumn,
+    position: number,
+    prev: { column: unknown; position: unknown },
+  ): Promise<void> {
+    try {
+      const r = await fetch(`/api/sessions/${encodeURIComponent(s.sessionId)}/board`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ column, position }),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok || body?.ok === false) {
+        s.kanbanColumn = prev.column;
+        s.kanbanPosition = prev.position;
+        lastKanbanHtml = '';
+        rerender();
+        // 401（只读访客）由全局 fetch patch 弹只读 toast，这里只负责回滚。
+        if (r.status !== 401) alert(`${t('sessions.kanban.moveFail')}: ${body?.error ?? r.status}`);
+      }
+    } catch (e) {
+      s.kanbanColumn = prev.column;
+      s.kanbanPosition = prev.position;
+      lastKanbanHtml = '';
+      rerender();
+      alert(`${t('sessions.kanban.moveFail')}: ${e}`);
+    }
+  }
+
+  async function persistRename(s: any, title: string): Promise<void> {
+    const prevTitle = s.title;
+    s.title = title;
+    lastKanbanHtml = '';
+    rerender();
+    try {
+      const r = await fetch(`/api/sessions/${encodeURIComponent(s.sessionId)}/rename`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ title }),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok || body?.ok === false) {
+        s.title = prevTitle;
+        lastKanbanHtml = '';
+        rerender();
+        if (r.status !== 401) alert(`${t('sessions.kanban.renameFail')}: ${body?.error ?? r.status}`);
+      }
+    } catch (e) {
+      s.title = prevTitle;
+      lastKanbanHtml = '';
+      rerender();
+      alert(`${t('sessions.kanban.renameFail')}: ${e}`);
+    }
+  }
+
+  /** 把卡片标题就地换成输入框：Enter/失焦保存，Esc 取消。 */
+  function startKanbanRename(card: HTMLElement, s: any): void {
+    const titleEl = card.querySelector<HTMLElement>('.kanban-card-title');
+    if (!titleEl || card.querySelector('.kanban-rename-input')) return;
+    kanbanEditing = true;
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'kanban-rename-input';
+    input.maxLength = 200;
+    input.value = stripMentionPrefix(s.title) || '';
+    titleEl.replaceWith(input);
+    input.focus();
+    input.select();
+    let settled = false;
+    const finish = (commit: boolean) => {
+      if (settled) return;
+      settled = true;
+      kanbanEditing = false;
+      const next = input.value.trim();
+      if (commit && next && next !== (stripMentionPrefix(s.title) || '')) {
+        void persistRename(s, next);
+      } else {
+        lastKanbanHtml = '';
+        rerender();
+      }
+    };
+    input.addEventListener('keydown', ev => {
+      ev.stopPropagation();
+      if (ev.key === 'Enter') { ev.preventDefault(); finish(true); }
+      else if (ev.key === 'Escape') { ev.preventDefault(); finish(false); }
+    });
+    input.addEventListener('blur', () => finish(true));
+    input.addEventListener('click', ev => ev.stopPropagation());
+  }
+
+  /** 指针 Y 落点之下的第一张卡片（不含拖拽源）—— 新卡插它前面；null = 追加列尾。 */
+  function kanbanInsertBeforeCard(column: HTMLElement, clientY: number): HTMLElement | null {
+    for (const card of column.querySelectorAll<HTMLElement>('.kanban-card:not(.dragging)')) {
+      const rect = card.getBoundingClientRect();
+      if (clientY < rect.top + rect.height / 2) return card;
+    }
+    return null;
+  }
+
+  function clearKanbanDragMarks(): void {
+    kanban.querySelectorAll('.drag-over, .dragging, .drop-before')
+      .forEach(el => el.classList.remove('drag-over', 'dragging', 'drop-before'));
   }
 
   // 页面内终端弹窗：默认嵌只读终端；已认证用户先 mint 可写链接（弹窗里能直接
@@ -554,8 +677,8 @@ export function renderSessionsPage(root: HTMLElement) {
     const status = f.get('status') as string;
     const adopt = f.get('adopt') as string;
     const active = !!f.get('active');
-    // 看板视图自带「已关闭」列，闭会话由列本身收纳——「仅活跃」开关不再把它们
-    // 整体滤掉，否则 Done 位永远是空的。
+    // 看板视图的「已完成」列收纳已关闭会话——「仅活跃」开关不再把它们整体
+    // 滤掉，否则该列永远是空的。
     const keepClosed = viewMode === 'kanban';
     const rows = [...store.sessions.values()]
       .filter(s => !cliFilterActive || cli.includes(s.cliId ?? 'unknown'))
@@ -938,7 +1061,15 @@ export function renderSessionsPage(root: HTMLElement) {
     });
   });
 
-  // ── 看板交互：卡片即终端入口，「详情」按钮进抽屉 ─────────────────────────
+  // ── 看板交互：单击开终端弹窗（延迟仲裁让位双击）、铅笔/双击改标题、
+  //    「详情」进抽屉、整卡拖拽换列与排序 ─────────────────────────────────────
+  function cancelKanbanOpen(): void {
+    if (kanbanOpenTimer !== null) {
+      clearTimeout(kanbanOpenTimer);
+      kanbanOpenTimer = null;
+    }
+  }
+
   kanban.addEventListener('click', e => {
     const target = e.target as HTMLElement;
     const card = target.closest<HTMLElement>('.kanban-card[data-id]');
@@ -948,10 +1079,25 @@ export function renderSessionsPage(root: HTMLElement) {
     const actionButton = target.closest<HTMLButtonElement>('button[data-action]');
     if (actionButton) {
       if (actionButton.dataset.action === 'details') openDrawer(s);
+      else if (actionButton.dataset.action === 'rename') startKanbanRename(card, s);
       return;
     }
     if (target.closest('a, button, input, label')) return;
-    void openTerminalModal(s);
+    cancelKanbanOpen();
+    kanbanOpenTimer = setTimeout(() => {
+      kanbanOpenTimer = null;
+      void openTerminalModal(s);
+    }, 220);
+  });
+
+  kanban.addEventListener('dblclick', e => {
+    const target = e.target as HTMLElement;
+    const titleEl = target.closest<HTMLElement>('.kanban-card-title');
+    const card = target.closest<HTMLElement>('.kanban-card[data-id]');
+    if (!titleEl || !card) return;
+    cancelKanbanOpen();
+    const s = store.sessions.get(card.dataset.id!);
+    if (s) startKanbanRename(card, s);
   });
 
   kanban.addEventListener('keydown', e => {
@@ -961,6 +1107,68 @@ export function renderSessionsPage(root: HTMLElement) {
     e.preventDefault();
     const s = store.sessions.get(target.dataset.id!);
     if (s) void openTerminalModal(s);
+  });
+
+  // ── 看板卡片拖拽 ──────────────────────────────────────────────────────────
+  kanban.addEventListener('dragstart', e => {
+    const card = (e.target as HTMLElement).closest<HTMLElement>('.kanban-card[data-id]');
+    if (!card) return;
+    cancelKanbanOpen();
+    kanbanDragId = card.dataset.id!;
+    card.classList.add('dragging');
+    if (e.dataTransfer) {
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', kanbanDragId);
+    }
+  });
+
+  kanban.addEventListener('dragover', e => {
+    if (!kanbanDragId) return;
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+    const column = (e.target as HTMLElement).closest<HTMLElement>('.kanban-column');
+    kanban.querySelectorAll('.drag-over').forEach(el => el.classList.remove('drag-over'));
+    kanban.querySelectorAll('.drop-before').forEach(el => el.classList.remove('drop-before'));
+    if (!column) return;
+    column.classList.add('drag-over');
+    kanbanInsertBeforeCard(column, e.clientY)?.classList.add('drop-before');
+  });
+
+  kanban.addEventListener('drop', e => {
+    if (!kanbanDragId) return;
+    e.preventDefault();
+    const dragId = kanbanDragId;
+    kanbanDragId = null;
+    clearKanbanDragMarks();
+    const column = (e.target as HTMLElement).closest<HTMLElement>('.kanban-column');
+    const targetCol = column?.dataset.col as SessionKanbanColumn | undefined;
+    const s = store.sessions.get(dragId);
+    if (!column || !targetCol || !s) return;
+    // 已关闭会话固定在「已完成」列，只允许列内重排。
+    if (s.status === 'closed' && targetCol !== 'done') return;
+    const beforeCard = kanbanInsertBeforeCard(column, e.clientY);
+    const colRows = (lastKanbanGroups.get(targetCol) ?? []).filter((r: any) => r.sessionId !== dragId);
+    let index = beforeCard ? colRows.findIndex((r: any) => r.sessionId === beforeCard.dataset.id) : colRows.length;
+    if (index < 0) index = colRows.length;
+    const prevRow = index > 0 ? colRows[index - 1] : null;
+    const nextRow = index < colRows.length ? colRows[index] : null;
+    const position = computeDropPosition(
+      prevRow ? effectiveKanbanPosition(prevRow) : null,
+      nextRow ? effectiveKanbanPosition(nextRow) : null,
+    );
+    const prev = { column: s.kanbanColumn, position: s.kanbanPosition };
+    s.kanbanColumn = targetCol;
+    s.kanbanPosition = position;
+    lastKanbanHtml = '';
+    rerender();
+    void persistBoardMove(s, targetCol, position, prev);
+  });
+
+  kanban.addEventListener('dragend', () => {
+    kanbanDragId = null;
+    clearKanbanDragMarks();
+    lastKanbanHtml = '';
+    rerender();
   });
 
   // 点弹窗 backdrop 关闭；关闭时清空内容，立刻断开 iframe 里的终端 WebSocket。
