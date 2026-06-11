@@ -27,6 +27,7 @@ import {
   recordUsageForDaemonSession,
   anchorUsageForDaemonSession,
   reconcileUsageForDaemonSession,
+  __resetUsageLedgerMemoryForTest,
   type UsageLedgerRecord,
 } from '../src/services/usage-ledger.js';
 import type { SessionTokenUsage } from '../src/core/cost-calculator.js';
@@ -68,6 +69,7 @@ let dir: string;
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'usage-ledger-'));
+  __resetUsageLedgerMemoryForTest();
 });
 
 afterEach(() => {
@@ -181,23 +183,51 @@ describe('recordSessionUsage', () => {
     expect(a!.recordId).not.toBe(b!.recordId);
   });
 
-  it('replays of the same baseline→snapshot transition reuse the recordId (crash idempotence)', () => {
-    // Crash window: ledger line appended but state.json never advanced. The
-    // replay recomputes the same delta from the same baseline — it must carry
-    // the SAME recordId so the consumer's DedupKey collapses the duplicate.
-    const a = recordSessionUsage({ ...baseArgs(), ledgerDir: dir, usage: cumulative(100, 10) });
+  it('recovers the baseline from the ledger when state never advanced (crash replay)', () => {
+    // Crash window: ledger line appended but state never advanced, then the
+    // daemon restarted (in-memory latest lost too). The ledger itself is the
+    // source of truth: its newest record's cumulative totals re-seed the
+    // baseline, so neither a same-snapshot replay nor a grown snapshot can
+    // double count the already-recorded interval.
+    recordSessionUsage({ ...baseArgs(), ledgerDir: dir, usage: cumulative(100, 10) });
 
-    // Simulate the lost state advance: restore the pre-record state file.
     const statePath = readdirSync(dir).find((f) => f.startsWith('state'));
     writeFileSync(join(dir, statePath!), JSON.stringify({ v: 1, sessions: {} }));
+    __resetUsageLedgerMemoryForTest(); // simulate process restart
 
-    const b = recordSessionUsage({
+    // Same snapshot replay → nothing new to record.
+    expect(recordSessionUsage({
       ...baseArgs({ now: new Date('2026-06-10T12:01:00Z') }),
       ledgerDir: dir,
       usage: cumulative(100, 10),
-    });
+    })).toBeNull();
 
-    expect(b!.recordId).toBe(a!.recordId);
+    // Grown snapshot → only the残余 delta beyond the ledger's latest totals.
+    const b = recordSessionUsage({
+      ...baseArgs({ now: new Date('2026-06-10T12:02:00Z') }),
+      ledgerDir: dir,
+      usage: cumulative(150, 15),
+    });
+    expect(b).toMatchObject({ inputTokens: 50, outputTokens: 5 });
+    expect(ledgerLines(dir)).toHaveLength(2);
+  });
+
+  it('recovers a stale (not just missing) baseline from the ledger', () => {
+    // Crash after appending 100→150 with the state save lost: state still says
+    // 100 while the ledger's newest record says 150. The newer one must win.
+    recordSessionUsage({ ...baseArgs(), ledgerDir: dir, usage: cumulative(100, 10) });
+    const statePath = join(dir, readdirSync(dir).find((f) => f.startsWith('state'))!);
+    const stateAt100 = readFileSync(statePath, 'utf8');
+    recordSessionUsage({ ...baseArgs({ now: new Date('2026-06-10T12:01:00Z') }), ledgerDir: dir, usage: cumulative(150, 15) });
+    writeFileSync(statePath, stateAt100); // roll the state back to 100/10
+    __resetUsageLedgerMemoryForTest();
+
+    const rec = recordSessionUsage({
+      ...baseArgs({ now: new Date('2026-06-10T12:02:00Z') }),
+      ledgerDir: dir,
+      usage: cumulative(180, 18),
+    });
+    expect(rec).toMatchObject({ inputTokens: 30, outputTokens: 3 });
   });
 
   it('does not reuse recordIds across reset epochs for identical transitions', () => {

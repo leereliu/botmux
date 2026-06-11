@@ -321,18 +321,21 @@ export function __resetSessionUsageCachesForTest(): void {
 /** Memoize a transcript-path lookup. `hitTtlMs === null` means a found path
  *  is trusted forever (rollout/transcript files never move); misses are
  *  retried after PATH_MISS_RETRY_MS — or immediately when `retryMiss` is set
- *  (ledger reads must see lazily created transcripts at turn boundaries). */
+ *  (ledger reads must see lazily created transcripts at turn boundaries).
+ *  `refreshHit` additionally re-resolves a cached positive hit — for sources
+ *  whose path MOVES between turns (aiden checkpoints), a fresh ledger read
+ *  must not settle for a stale path inside the hit TTL. */
 function cachedPathLookup(
   key: string,
   hitTtlMs: number | null,
   lookup: () => string | null,
-  opts?: { retryMiss?: boolean },
+  opts?: { retryMiss?: boolean; refreshHit?: boolean },
 ): string | null {
   const now = Date.now();
   const cached = sessionPathCache.get(key);
   if (cached) {
     if (cached.path !== null) {
-      if (hitTtlMs === null || now - cached.atMs < hitTtlMs) return cached.path;
+      if (!opts?.refreshHit && (hitTtlMs === null || now - cached.atMs < hitTtlMs)) return cached.path;
     } else if (!opts?.retryMiss && now - cached.atMs < PATH_MISS_RETRY_MS) {
       return null;
     }
@@ -579,7 +582,7 @@ export function getSessionTokenUsage(q: SessionTokenUsageQuery): SessionTokenUsa
         findAidenLatestCheckpointBySessionId(sid, undefined, q.cwd) ??
         findAidenLatestCheckpointByBotmuxSessionId(q.sessionId, undefined, q.cwd) ??
         null,
-      { retryMiss: q.fresh },
+      { retryMiss: q.fresh, refreshHit: q.fresh },
     );
     if (!checkpointPath || !existsSync(checkpointPath)) return null;
     return readSessionTokenUsageFile(checkpointPath, 'aiden', { fresh: q.fresh });

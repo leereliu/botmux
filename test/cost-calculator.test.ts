@@ -740,6 +740,25 @@ describe('getSessionTokenUsage', () => {
     expect(findAidenLatestCheckpointBySessionId).toHaveBeenCalledTimes(1);
   });
 
+  it('fresh aiden lookups bypass the positive hit TTL (checkpoints move per turn)', () => {
+    vi.mocked(findAidenLatestCheckpointBySessionId).mockReturnValue('/home/testuser/.aiden/checkpoints/ws/aiden-sid/cp-1.json');
+    setupJsonl(JSON.stringify({
+      checkpoint: { channel_values: { messages: [{ type: 'ai', usage_metadata: { input_tokens: 1, output_tokens: 1 } }] } },
+    }));
+
+    getSessionTokenUsage({ cliId: 'aiden', sessionId: 'aiden-sid' });
+    expect(findAidenLatestCheckpointBySessionId).toHaveBeenCalledTimes(1);
+
+    // Ledger (fresh) reads must re-resolve: latest.json points at a NEW
+    // checkpoint file every turn, and a 15s-stale path misses the last turn.
+    getSessionTokenUsage({ cliId: 'aiden', sessionId: 'aiden-sid', fresh: true });
+    expect(findAidenLatestCheckpointBySessionId).toHaveBeenCalledTimes(2);
+
+    // The dashboard (non-fresh) path keeps the TTL cache.
+    getSessionTokenUsage({ cliId: 'aiden', sessionId: 'aiden-sid' });
+    expect(findAidenLatestCheckpointBySessionId).toHaveBeenCalledTimes(2);
+  });
+
   it('counts a multi-block Claude turn (same message.id) once', () => {
     const block = (id: string, input: number, output: number, cacheRead = 0, cacheCreate = 0) =>
       JSON.stringify({

@@ -15,7 +15,7 @@
  * callerOpenId, cumulative totals) so a single excerpted line self-validates
  * without joining back to sessions.json.
  */
-import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -27,6 +27,9 @@ export interface UsageLedgerRecord {
   v: 1;
   recordId: string;
   ts: string;
+  /** Baseline reset epoch this delta was measured in — lets the ledger itself
+   *  re-seed a lost baseline (crash recovery) without ambiguity. */
+  epoch: number;
   larkAppId?: string;
   sessionId: string;
   cliId?: string;
@@ -80,6 +83,95 @@ interface SessionBaseline {
 interface LedgerState {
   v: 1;
   sessions: { [sessionId: string]: SessionBaseline };
+}
+
+/** Last authoritative baseline per session, kept in memory: the hot path
+ *  never rescans the ledger, and a lost/stale state file inside one process
+ *  lifetime cannot regress the baseline. */
+const sessionBaselineMemory = new Map<string, SessionBaseline | null>();
+
+export function __resetUsageLedgerMemoryForTest(): void {
+  sessionBaselineMemory.clear();
+}
+
+function baselineMemoryKey(larkAppId: string | undefined, sessionId: string): string {
+  return `${larkAppId ?? ''}\u0000${sessionId}`;
+}
+
+function finiteNum(v: unknown): number {
+  return typeof v === 'number' && Number.isFinite(v) ? v : 0;
+}
+
+/** Reconstruct the newest baseline for a session from the ledger files
+ *  themselves (newest file first; last matching line in a file is newest).
+ *  This is the crash-recovery source of truth: a record that reached the
+ *  ledger but whose state advance was lost is still binding. */
+function baselineFromLedger(dir: string, sessionId: string): SessionBaseline | null {
+  let files: string[];
+  try {
+    files = readdirSync(dir)
+      .filter((f) => /^usage-\d{4}-\d{2}-\d{2}\.jsonl$/.test(f))
+      .sort()
+      .reverse();
+  } catch {
+    return null;
+  }
+  for (const name of files) {
+    let content: string;
+    try {
+      content = readFileSync(join(dir, name), 'utf8');
+    } catch {
+      continue;
+    }
+    let latest: any = null;
+    for (const line of content.split('\n')) {
+      if (!line.includes(sessionId)) continue;
+      try {
+        const rec = JSON.parse(line);
+        if (rec?.sessionId === sessionId) latest = rec;
+      } catch { /* skip malformed lines */ }
+    }
+    if (latest) {
+      return {
+        inputTokens: finiteNum(latest.totalInputTokens),
+        outputTokens: finiteNum(latest.totalOutputTokens),
+        cacheReadTokens: finiteNum(latest.totalCacheReadTokens),
+        cacheCreateTokens: finiteNum(latest.totalCacheCreateTokens),
+        recordedAt: typeof latest.ts === 'string' ? latest.ts : new Date(0).toISOString(),
+        epoch: finiteNum(latest.epoch),
+      };
+    }
+  }
+  return null;
+}
+
+/** Of two baseline candidates, pick the newer: higher epoch wins; within an
+ *  epoch totals are monotonic, so the larger sum wins. */
+function newerBaseline(a: SessionBaseline | undefined | null, b: SessionBaseline | undefined | null): SessionBaseline | undefined {
+  if (!a) return b ?? undefined;
+  if (!b) return a;
+  const ea = a.epoch ?? 0;
+  const eb = b.epoch ?? 0;
+  if (ea !== eb) return ea > eb ? a : b;
+  const sum = (x: SessionBaseline) => x.inputTokens + x.outputTokens + x.cacheReadTokens + x.cacheCreateTokens;
+  return sum(a) >= sum(b) ? a : b;
+}
+
+/** Effective baseline = newest of (state file, in-memory latest, ledger scan).
+ *  The ledger scan runs at most once per session per process lifetime. */
+function resolveBaseline(
+  dir: string,
+  larkAppId: string | undefined,
+  sessionId: string,
+  stateBaseline: SessionBaseline | undefined,
+): SessionBaseline | undefined {
+  const key = baselineMemoryKey(larkAppId, sessionId);
+  let remembered = sessionBaselineMemory.get(key);
+  if (remembered === undefined) {
+    remembered = baselineFromLedger(dir, sessionId);
+    sessionBaselineMemory.set(key, remembered);
+  }
+  return newerBaseline(stateBaseline, remembered);
 }
 
 /** Baselines for sessions idle longer than this are pruned from state.json. */
@@ -165,7 +257,7 @@ export function recordSessionUsage(args: RecordSessionUsageArgs): UsageLedgerRec
     mkdirSync(dir, { recursive: true });
 
     const state = loadState(dir, args.larkAppId);
-    const prev = state.sessions[args.sessionId];
+    const prev = resolveBaseline(dir, args.larkAppId, args.sessionId, state.sessions[args.sessionId]);
     const cur = args.usage;
     const prevEpoch = prev?.epoch ?? 0;
 
@@ -190,6 +282,7 @@ export function recordSessionUsage(args: RecordSessionUsageArgs): UsageLedgerRec
       baseline.epoch = prevEpoch + 1;
       state.sessions[args.sessionId] = baseline;
       saveState(dir, args.larkAppId, state, now);
+      sessionBaselineMemory.set(baselineMemoryKey(args.larkAppId, args.sessionId), baseline);
       return null;
     }
     if (deltaInput === 0 && deltaOutput === 0 && deltaCacheRead === 0 && deltaCacheCreate === 0) {
@@ -200,6 +293,7 @@ export function recordSessionUsage(args: RecordSessionUsageArgs): UsageLedgerRec
       v: 1,
       recordId: deterministicRecordId(args.sessionId, prevEpoch, prev, cur),
       ts: now.toISOString(),
+      epoch: prevEpoch,
       ...(args.larkAppId ? { larkAppId: args.larkAppId } : {}),
       sessionId: args.sessionId,
       ...(args.cliId ? { cliId: args.cliId } : {}),
@@ -224,6 +318,7 @@ export function recordSessionUsage(args: RecordSessionUsageArgs): UsageLedgerRec
     appendFileSync(ledgerFilePath(dir, now), JSON.stringify(record) + '\n');
     state.sessions[args.sessionId] = baseline;
     saveState(dir, args.larkAppId, state, now);
+    sessionBaselineMemory.set(baselineMemoryKey(args.larkAppId, args.sessionId), baseline);
     return record;
   } catch (err: any) {
     // The ledger must never take the daemon down with it.
@@ -246,7 +341,8 @@ export function anchorSessionUsage(args: RecordSessionUsageArgs): void {
     mkdirSync(dir, { recursive: true });
 
     const state = loadState(dir, args.larkAppId);
-    state.sessions[args.sessionId] = {
+    const prev = resolveBaseline(dir, args.larkAppId, args.sessionId, state.sessions[args.sessionId]);
+    const baseline: SessionBaseline = {
       inputTokens: args.usage.inputTokens,
       outputTokens: args.usage.outputTokens,
       cacheReadTokens: args.usage.cacheReadTokens,
@@ -254,9 +350,11 @@ export function anchorSessionUsage(args: RecordSessionUsageArgs): void {
       recordedAt: now.toISOString(),
       // Anchors start a new epoch: transitions after a re-anchor must never
       // collide with recordIds from before it.
-      epoch: (state.sessions[args.sessionId]?.epoch ?? 0) + 1,
+      epoch: (prev?.epoch ?? 0) + 1,
     };
+    state.sessions[args.sessionId] = baseline;
     saveState(dir, args.larkAppId, state, now);
+    sessionBaselineMemory.set(baselineMemoryKey(args.larkAppId, args.sessionId), baseline);
   } catch (err: any) {
     logger.error(`usage-ledger: failed to anchor session baseline: ${err?.message ?? err}`);
   }
@@ -319,7 +417,7 @@ export function reconcileUsageForDaemonSession(ds: DaemonSession, opts?: DaemonS
     if (!args.usage) return null;
     const dir = opts?.ledgerDir ?? defaultLedgerDir();
     const state = loadState(dir, args.larkAppId);
-    if (state.sessions[args.sessionId]) {
+    if (resolveBaseline(dir, args.larkAppId, args.sessionId, state.sessions[args.sessionId])) {
       return recordSessionUsage({ ...args, usage: args.usage, ...opts });
     }
     anchorSessionUsage({ ...args, usage: args.usage, ...opts });
