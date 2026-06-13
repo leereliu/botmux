@@ -2501,14 +2501,19 @@ export async function discoverResumableSessionsForBot(
   let adapter: ReturnType<typeof createCliAdapterSync>;
   try { adapter = createCliAdapterSync(cliId, cliPathOverride); } catch { return []; }
   if (!adapter.listResumableSessions) return [];
-  // Exclude sessions botmux already runs live. Passed INTO the adapter so the
-  // exclusion happens before the `limit` truncation — otherwise a host with
-  // many live sessions (the most-recently-active transcripts) would see the
-  // whole top-`limit` filtered away, leaving the picker nearly empty.
-  const exclude = new Set<string>();
+  // Exclude every session botmux already manages — live OR closed — so the
+  // picker surfaces only genuinely external sessions (a CLI the user ran
+  // standalone). botmux's own closed sessions stay resumable via their
+  // session-closed cards, so hiding them here avoids a redundant, confusing
+  // duplicate. The identity set spans all bot stores and includes both the
+  // botmux sessionId (= the claude jsonl filename) and the cliSessionId
+  // (codex/traex rollout id), covering every CLI's id shape. Passed INTO the
+  // adapter so exclusion happens BEFORE the `limit` truncation.
+  const exclude = sessionStore.collectBotmuxSessionIdentities() ?? new Set<string>();
+  // Belt-and-suspenders: also fold in the in-memory active map (freshest).
   for (const ds of activeSessions.values()) {
-    const sid = ds.session.cliSessionId;
-    if (sid) exclude.add(sid);
+    if (ds.session.sessionId) exclude.add(ds.session.sessionId);
+    if (ds.session.cliSessionId) exclude.add(ds.session.cliSessionId);
   }
   try {
     return await adapter.listResumableSessions({ limit, exclude });

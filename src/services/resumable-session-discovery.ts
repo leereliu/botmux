@@ -78,16 +78,24 @@ function truncateTitle(text: string): string {
   return norm.length > TITLE_MAX ? `${norm.slice(0, TITLE_MAX - 1)}…` : norm;
 }
 
-/** botmux wraps every forwarded user message before handing it to the CLI, in
- *  one of two historical shapes: `<user_message>…</user_message>` (current) or
- *  `用户发送了：\n---\n<text>\n---\n…` (older). For a cleaner picker title, peel the
- *  wrapper off when present; otherwise return as-is (sessions started outside
- *  botmux carry the raw prompt and are left untouched). */
-function unwrapBotmuxPrompt(text: string): string {
-  const xml = text.match(/<user_message>\s*([\s\S]*?)\s*<\/user_message>/);
-  if (xml) return xml[1]!;
-  const legacy = text.match(/^用户发送了：\s*\n-{3,}\n([\s\S]*?)\n-{3,}/);
-  return legacy ? legacy[1]! : text;
+/** botmux injects identifiable wrappers into every message it forwards to the
+ *  CLI: the per-message `<sender type=…>` footer + `<user_message>…</user_message>`
+ *  envelope, the `<botmux_routing>` block, the legacy `用户发送了：` prefix, or a
+ *  `[来自 … 的 @mention]` bot handoff. A session whose user turn carries any of
+ *  these was spawned BY botmux.
+ *
+ *  Per the `/adopt` resume design (option B), such sessions are hidden from the
+ *  picker — botmux's own sessions are already resumable through their topic or
+ *  session-closed card, so re-importing them is redundant and confusing. The
+ *  picker exists to import GENUINELY EXTERNAL sessions (a CLI the user ran
+ *  standalone in a terminal), whose first prompt is raw text with none of these
+ *  markers. The session store can't be used for this — it doesn't retain closed
+ *  sessions — but the transcript wrapper is a reliable, retention-independent
+ *  signal. */
+const BOTMUX_INJECTION_RE = /<sender type=|<\/?user_message>|<botmux_routing>|^用户发送了：\s*\n-{3,}|\[来自[^\]]*?@mention\]/;
+
+function isBotmuxInjected(text: string): boolean {
+  return BOTMUX_INJECTION_RE.test(text);
 }
 
 interface FileEntry { path: string; mtimeMs: number; }
@@ -140,24 +148,31 @@ async function parseClaudeTranscript(path: string, mtimeMs: number): Promise<Res
   if (!cliSessionId) return null;
   // Accumulate into an object (see parseRolloutTranscript) so the post-loop
   // guard narrows correctly despite closure mutation.
-  const acc: { cwd: string | null; title: string } = { cwd: null, title: '' };
+  const acc: { cwd: string | null; title: string; botmux: boolean } = { cwd: null, title: '', botmux: false };
   await forEachJsonLine(path, (rec) => {
     if (rec.isSidechain === true) return;
     if (!acc.cwd && typeof rec.cwd === 'string') acc.cwd = rec.cwd;
-    if (!acc.title && rec.type === 'user') {
-      const text = extractClaudeUserText(rec.message);
-      if (text) acc.title = truncateTitle(text);
+    if (rec.type === 'user') {
+      const raw = rawClaudeUserText(rec.message);
+      if (raw && isBotmuxInjected(raw)) { acc.botmux = true; return true; } // botmux-origin → drop
+      if (!acc.title && raw) {
+        const clean = cleanUserPromptForTitle(raw);
+        if (clean) acc.title = truncateTitle(clean);
+      }
     }
     return Boolean(acc.cwd && acc.title); // stop once we have everything
   });
-  if (!acc.cwd) return null;
-  return { cliSessionId, cwd: acc.cwd, title: acc.title || `Claude ${cliSessionId.slice(0, 8)}`, lastActivityAt: mtimeMs };
+  // Drop botmux-origin sessions and empties (no real user prompt → command-only
+  // / aborted — not worth importing).
+  if (acc.botmux || !acc.cwd || !acc.title) return null;
+  return { cliSessionId, cwd: acc.cwd, title: acc.title, lastActivityAt: mtimeMs };
 }
 
-/** Pull plain user text out of a Claude `message` field, skipping tool-result
- *  array content and slash-command meta lines (which start with `<command-…>`
- *  or are pure `/cmd` invocations — not a meaningful conversation title). */
-function extractClaudeUserText(message: unknown): string | null {
+/** Pull plain user text out of a Claude `message` field (string content or the
+ *  first text part of array content), trimmed. Returns null for tool-result /
+ *  non-text messages. No filtering — used both for botmux-origin detection
+ *  (which must see the raw wrapper) and as the source for the title. */
+function rawClaudeUserText(message: unknown): string | null {
   const msg = asRecord(message);
   if (!msg || msg.role !== 'user') return null;
   let text: string | null = null;
@@ -168,10 +183,15 @@ function extractClaudeUserText(message: unknown): string | null {
     const t = asRecord(part)?.text;
     if (typeof t === 'string') text = t;
   }
-  if (!text) return null;
-  const trimmed = text.trim();
-  if (!trimmed || trimmed.startsWith('<command-') || trimmed.startsWith('<local-command')) return null;
-  return unwrapBotmuxPrompt(trimmed);
+  const trimmed = text?.trim();
+  return trimmed || null;
+}
+
+/** Reject slash-command / local-command meta turns (not a meaningful title);
+ *  returns the text otherwise. */
+function cleanUserPromptForTitle(raw: string): string | null {
+  if (raw.startsWith('<command-') || raw.startsWith('<local-command')) return null;
+  return raw;
 }
 
 export async function discoverClaudeFamilySessions(
@@ -202,7 +222,7 @@ async function parseRolloutTranscript(
   // Accumulate into an object — closure mutation of plain `let` defeats TS's
   // control-flow narrowing at the post-loop guard; object properties keep their
   // declared type.
-  const acc: { id: string | null; cwd: string | null; title: string } = { id: null, cwd: null, title: '' };
+  const acc: { id: string | null; cwd: string | null; title: string; botmux: boolean } = { id: null, cwd: null, title: '', botmux: false };
   let excluded = false;
   await forEachJsonLine(path, (rec) => {
     const payload = asRecord(rec.payload);
@@ -214,13 +234,14 @@ async function parseRolloutTranscript(
         if (exclude?.has(payload.id)) { excluded = true; return true; }
       }
       if (typeof payload.cwd === 'string') acc.cwd = payload.cwd;
-    } else if (!acc.title && rec.type === 'event_msg' && payload?.type === 'user_message') {
-      if (typeof payload.message === 'string') acc.title = truncateTitle(unwrapBotmuxPrompt(payload.message));
+    } else if (rec.type === 'event_msg' && payload?.type === 'user_message' && typeof payload.message === 'string') {
+      if (isBotmuxInjected(payload.message)) { acc.botmux = true; return true; } // botmux-origin → drop
+      if (!acc.title) acc.title = truncateTitle(payload.message);
     }
     return Boolean(acc.id && acc.cwd && acc.title);
   });
-  if (excluded || !acc.id || !acc.cwd) return null;
-  return { cliSessionId: acc.id, cwd: acc.cwd, title: acc.title || `Session ${acc.id.slice(0, 8)}`, lastActivityAt: mtimeMs };
+  if (excluded || acc.botmux || !acc.id || !acc.cwd || !acc.title) return null;
+  return { cliSessionId: acc.id, cwd: acc.cwd, title: acc.title, lastActivityAt: mtimeMs };
 }
 
 export async function discoverRolloutSessions(
@@ -257,6 +278,7 @@ export async function discoverAntigravitySessions(
   exclude?: ReadonlySet<string>,
 ): Promise<ResumableSession[]> {
   const byConversation = new Map<string, ResumableSession>();
+  const botmuxConversations = new Set<string>(); // conversations with any botmux-injected submit
   // Read the full log (high line cap, no byte prefix) so tail entries are seen.
   await forEachJsonLine(historyPath, (rec) => {
     const conversationId = rec.conversationId;
@@ -264,12 +286,15 @@ export async function discoverAntigravitySessions(
     if (typeof conversationId !== 'string' || !conversationId || typeof workspace !== 'string' || !workspace) return;
     const ts = typeof rec.timestamp === 'number' ? rec.timestamp : 0;
     const display = typeof rec.display === 'string' ? rec.display : '';
+    // A botmux-injected submit marks the whole conversation as botmux-origin.
+    if (isBotmuxInjected(display)) { botmuxConversations.add(conversationId); return; }
     const existing = byConversation.get(conversationId);
     if (!existing) {
+      if (!display.trim()) return; // empty/no-prompt submit — skip
       byConversation.set(conversationId, {
         cliSessionId: conversationId,
         cwd: workspace,
-        title: truncateTitle(unwrapBotmuxPrompt(display)) || `Conversation ${conversationId.slice(0, 8)}`,
+        title: truncateTitle(display),
         lastActivityAt: ts,
       });
     } else if (ts > existing.lastActivityAt) {
@@ -277,7 +302,7 @@ export async function discoverAntigravitySessions(
     }
   }, 1_000_000);
   return [...byConversation.values()]
-    .filter((s) => !exclude?.has(s.cliSessionId))
+    .filter((s) => !exclude?.has(s.cliSessionId) && !botmuxConversations.has(s.cliSessionId))
     .sort((a, b) => b.lastActivityAt - a.lastActivityAt)
     .slice(0, limit);
 }

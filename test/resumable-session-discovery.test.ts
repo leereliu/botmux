@@ -56,12 +56,25 @@ describe('discoverClaudeFamilySessions', () => {
     expect(out[0]?.title).toBe('the real first question');
   });
 
-  it('unwraps the botmux <user_message> wrapper for a clean title', async () => {
+  // Option B: sessions botmux itself spawned (their user turns carry botmux's
+  // injected wrapper) are hidden — the picker is for external sessions only.
+  it('drops botmux-origin sessions (user turn carries the injected wrapper)', async () => {
     writeSession('-root-proj', 'cccc3333-0000-0000-0000-000000000003', [
-      { type: 'user', cwd: '/root/proj', message: { role: 'user', content: '<user_message>\n@Claude do the thing\n</user_message>\n<sender />' } },
+      { type: 'user', cwd: '/root/proj', message: { role: 'user', content: '<user_message>\n@Claude do the thing\n</user_message>\n<sender type="user" open_id="ou_x" />' } },
+    ]);
+    // A standalone session in the same project survives.
+    writeSession('-root-proj', 'eeee5555-0000-0000-0000-000000000005', [
+      { type: 'user', cwd: '/root/proj', message: { role: 'user', content: 'just a normal prompt I typed' } },
     ]);
     const out = await discoverClaudeFamilySessions(dataDir, 10);
-    expect(out[0]?.title).toBe('@Claude do the thing');
+    expect(out.map((s) => s.cliSessionId)).toEqual(['eeee5555-0000-0000-0000-000000000005']);
+  });
+
+  it('drops empty / command-only sessions (no real user prompt)', async () => {
+    writeSession('-root-proj', 'ffff6666-0000-0000-0000-000000000006', [
+      { type: 'user', cwd: '/root/proj', message: { role: 'user', content: '<local-command-caveat>...</local-command-caveat>' } },
+    ]);
+    expect(await discoverClaudeFamilySessions(dataDir, 10)).toEqual([]);
   });
 
   it('drops transcripts with no cwd, returns most-recent first within limit', async () => {
@@ -134,13 +147,17 @@ describe('discoverRolloutSessions (codex / traex)', () => {
     });
   });
 
-  it('unwraps the botmux user_message wrapper', async () => {
-    writeRollout('2026/06/12', 'rollout-x.jsonl', [
-      { type: 'session_meta', payload: { id: 'sid-2', cwd: '/root/x' } },
+  it('drops botmux-origin rollouts (user_message carries the injected wrapper)', async () => {
+    writeRollout('2026/06/12', 'rollout-bmx.jsonl', [
+      { type: 'session_meta', payload: { id: 'sid-bmx', cwd: '/root/x' } },
       { type: 'event_msg', payload: { type: 'user_message', message: '用户发送了：\n---\nactual prompt\n---\n\nSession ID: zzz' } },
     ]);
+    writeRollout('2026/06/13', 'rollout-ext.jsonl', [
+      { type: 'session_meta', payload: { id: 'sid-ext', cwd: '/root/y' } },
+      { type: 'event_msg', payload: { type: 'user_message', message: 'a prompt typed straight into codex' } },
+    ]);
     const out = await discoverRolloutSessions(sessionsRoot, 10);
-    expect(out[0]?.title).toBe('actual prompt');
+    expect(out.map((s) => s.cliSessionId)).toEqual(['sid-ext']);
   });
 
   it('excludes live rollout ids and keeps collecting until limit is met', async () => {
@@ -181,6 +198,15 @@ describe('discoverAntigravitySessions', () => {
     // conv-1 sorts first (latest activity 2000) and keeps its first display.
     expect(out[0]).toMatchObject({ cliSessionId: 'conv-1', cwd: '/root/p1', title: 'first turn', lastActivityAt: 2000 });
     expect(out[1]).toMatchObject({ cliSessionId: 'conv-2', title: 'other convo' });
+  });
+
+  it('drops conversations with any botmux-injected submit', async () => {
+    writeFileSync(historyPath, jsonl(
+      { display: '<user_message>@agy hi</user_message>\n<sender type="user" open_id="ou_z" />', timestamp: 100, workspace: '/root/bmx', conversationId: 'conv-bmx' },
+      { display: 'a normal standalone prompt', timestamp: 200, workspace: '/root/ext', conversationId: 'conv-ext' },
+    ));
+    const out = await discoverAntigravitySessions(historyPath, 10);
+    expect(out.map((s) => s.cliSessionId)).toEqual(['conv-ext']);
   });
 
   it('skips entries missing conversationId or workspace', async () => {
