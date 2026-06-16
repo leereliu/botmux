@@ -134,6 +134,7 @@ function usageKindForCli(cliId: SessionTokenUsageQuery['cliId']): UsageKind {
   switch (cliId) {
     case 'claude-code':
     case 'seed':
+    case 'relay':
       return 'claude';
     case 'codex':
       return 'codex';
@@ -551,6 +552,7 @@ function tokenUsagePathForSession(q: SessionTokenUsageQuery): string | null {
     case 'claude-code':
       return q.cwd ? getClaudeSessionJsonlPath(sid, q.cwd, join(homedir(), '.claude')) : null;
     case 'seed':
+    case 'relay':
       return q.cwd ? getClaudeSessionJsonlPath(sid, q.cwd, process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude-runtime')) : null;
     case 'codex':
       return cachedPathLookup(`codex:${q.sessionId}:${q.cliSessionId ?? ''}`, null, () => {
