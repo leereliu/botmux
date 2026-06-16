@@ -7,6 +7,7 @@ import { homedir } from 'node:os';
 import { logger } from '../utils/logger.js';
 import { expandHome } from './working-dir.js';
 import type { CliId } from '../adapters/cli/types.js';
+import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { findAidenLatestCheckpointByBotmuxSessionId, findAidenLatestCheckpointBySessionId } from '../services/aiden-checkpoints.js';
 import { findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId } from '../services/codex-transcript.js';
 import { cocoEventsPathForSession } from '../services/coco-transcript.js';
@@ -546,6 +547,30 @@ function readTokenUsageFromAidenCheckpoint(path: string): SessionTokenUsage | nu
   };
 }
 
+/** Resolve a Claude-family fork's (seed / relay) data root the SAME way its
+ *  adapter does — by realpath-resolving the binary to `<pkg>/.claude-runtime`
+ *  (see deriveSeedDataDir / deriveRelayDataDir). The previous
+ *  `process.env.CLAUDE_CONFIG_DIR || ~/.claude-runtime` was wrong on a default
+ *  install: the adapter injects CLAUDE_CONFIG_DIR only into the *child*, so the
+ *  daemon's own env has it unset, and the real root is the package-local
+ *  `.claude-runtime`, not `~/.claude-runtime` — so usage reads missed the
+ *  transcript entirely. Cached so the dashboard read path doesn't shell out
+ *  (`which`) on every refresh. An explicit CLAUDE_CONFIG_DIR on the daemon still
+ *  wins, matching the adapter's spawnEnv precedence.
+ *
+ *  Uses the DEFAULT binary (no per-bot cliPathOverride); a custom path would
+ *  resolve a different root, but that narrow case was already unsupported here. */
+const claudeForkDataDirCache = new Map<string, string>();
+function claudeForkDataDir(cliId: 'seed' | 'relay'): string {
+  const env = process.env.CLAUDE_CONFIG_DIR;
+  if (env) return env;
+  const cached = claudeForkDataDirCache.get(cliId);
+  if (cached) return cached;
+  const dir = createCliAdapterSync(cliId).claudeDataDir ?? join(homedir(), '.claude-runtime');
+  claudeForkDataDirCache.set(cliId, dir);
+  return dir;
+}
+
 function tokenUsagePathForSession(q: SessionTokenUsageQuery): string | null {
   const sid = q.cliSessionId || q.sessionId;
   switch (q.cliId) {
@@ -553,7 +578,7 @@ function tokenUsagePathForSession(q: SessionTokenUsageQuery): string | null {
       return q.cwd ? getClaudeSessionJsonlPath(sid, q.cwd, join(homedir(), '.claude')) : null;
     case 'seed':
     case 'relay':
-      return q.cwd ? getClaudeSessionJsonlPath(sid, q.cwd, process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude-runtime')) : null;
+      return q.cwd ? getClaudeSessionJsonlPath(sid, q.cwd, claudeForkDataDir(q.cliId)) : null;
     case 'codex':
       return cachedPathLookup(`codex:${q.sessionId}:${q.cliSessionId ?? ''}`, null, () => {
         const codexSid = q.cliSessionId || findCodexSessionIdByBotmuxSessionId(q.sessionId) || q.sessionId;
