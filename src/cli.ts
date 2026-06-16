@@ -28,7 +28,7 @@ import { createInterface } from 'node:readline';
 import { createRequire } from 'node:module';
 import { createHmac, randomBytes } from 'node:crypto';
 import { validateWorkingDir } from './core/working-dir.js';
-import { findAncestorSessionContext as findAncestorSessionContextFromMarkers } from './core/session-marker.js';
+import { resolveSessionContext } from './core/session-marker.js';
 import { parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, offTopicSubBotTopic, resolveReportTarget, resolveSendTarget } from './core/dispatch.js';
 import { enableAutostart, disableAutostart, autostartStatus, refreshAutostart } from './autostart.js';
 import { tmuxEnv } from './setup/ensure-tmux.js';
@@ -2656,15 +2656,14 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
 // ─── Schedule subcommands ────────────────────────────────────────────────────
 
 /**
- * Walk the process tree looking for a CLI-pid marker written by the botmux
- * worker. Returns the sessionId stored in the marker (or '' if empty/legacy).
- *
- * This mirrors server.ts:findAncestorCliMarker but is local to cli.ts so
- * subcommands invoked from inside an agent session can auto-detect which
- * session they belong to.
+ * Resolve which botmux session this subcommand belongs to. Prefers the
+ * process-tree CLI-pid marker (carries the fresh turnId); falls back to the
+ * inherited BOTMUX_SESSION_ID env when the ancestry is broken (detached/
+ * backgrounded/deeply-nested invocations). See resolveSessionContext for why
+ * the env fallback is safe.
  */
 function findAncestorSessionContext(): { sessionId: string; turnId?: string } | null {
-  return findAncestorSessionContextFromMarkers(resolveDataDir());
+  return resolveSessionContext(resolveDataDir(), process.env.BOTMUX_SESSION_ID);
 }
 
 function findAncestorSessionId(): string | null {
