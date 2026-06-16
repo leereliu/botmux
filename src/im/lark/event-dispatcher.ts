@@ -1745,21 +1745,27 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
   // 诊断：包一层 invoke，记录长连接收到的**每一个**事件类型（含未注册的）。
   // 排查云文档评论事件是否真送达 / 实际事件名用——comment 类一律连 payload 关键字段
   // 一起打。日常其它事件只在 DEBUG 下打，避免刷屏。
-  const __origInvoke = (eventDispatcher as any).invoke.bind(eventDispatcher);
-  (eventDispatcher as any).invoke = (data: any) => {
-    try {
-      const et: string = data?.header?.event_type ?? data?.event_type ?? data?.type ?? 'unknown';
-      const isCommentish = typeof et === 'string' && et.includes('comment');
-      if (isCommentish) {
-        const ev = data?.event ?? data;
-        const p = parseCommentEvent(data);
-        logger.info(`[ws-event] ${larkAppId} event_type=${et} → parsed fileToken=${p.fileToken ?? '?'} commentId=${p.commentId ?? '?'} replyId=${p.replyId ?? '?'} isMentioned=${p.isMentioned} | notice_meta=${JSON.stringify(ev?.notice_meta ?? ev?.noticeMeta ?? null)}`);
-      } else if (process.env.DEBUG) {
-        logger.info(`[ws-event] ${larkAppId} event_type=${et}`);
-      }
-    } catch { /* 诊断不阻断分发 */ }
-    return __origInvoke(data);
-  };
+  // 仅当 dispatcher 真有 invoke 方法时才包（单测里 Lark.EventDispatcher 是 mock，
+  // register() 返回的对象没有 invoke → 不包，避免 undefined.bind 抛错）。
+  const __origInvoke = typeof (eventDispatcher as any).invoke === 'function'
+    ? (eventDispatcher as any).invoke.bind(eventDispatcher)
+    : undefined;
+  if (__origInvoke) {
+    (eventDispatcher as any).invoke = (data: any) => {
+      try {
+        const et: string = data?.header?.event_type ?? data?.event_type ?? data?.type ?? 'unknown';
+        const isCommentish = typeof et === 'string' && et.includes('comment');
+        if (isCommentish) {
+          const ev = data?.event ?? data;
+          const p = parseCommentEvent(data);
+          logger.info(`[ws-event] ${larkAppId} event_type=${et} → parsed fileToken=${p.fileToken ?? '?'} commentId=${p.commentId ?? '?'} replyId=${p.replyId ?? '?'} isMentioned=${p.isMentioned} | notice_meta=${JSON.stringify(ev?.notice_meta ?? ev?.noticeMeta ?? null)}`);
+        } else if (process.env.DEBUG) {
+          logger.info(`[ws-event] ${larkAppId} event_type=${et}`);
+        }
+      } catch { /* 诊断不阻断分发 */ }
+      return __origInvoke(data);
+    };
+  }
 
   // Start WSClient
   const wsClient = new Lark.WSClient({
