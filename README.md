@@ -145,10 +145,11 @@ BACKEND_TYPE=pty botmux start
 将已在 tmux 中运行的 CLI 进程无缝接入 Botmux，在手机上通过飞书查看进度和交互。
 
 ```
-/adopt              # 扫描 tmux，弹出选择卡片
-/adopt 0:2.0        # 直接接入指定 tmux pane
+/adopt              # 弹出选择卡片：① 接管运行中的会话 ② 从磁盘 resume 导入历史会话
+/adopt 0:2.0        # 直接接入指定 tmux pane（或传历史会话 id 直接 resume 导入）
 ```
 
+- **历史会话导入** — 卡片第二栏列出本机该 CLI 的历史会话（claude-code / seed / codex / traex / antigravity），选中即以 `--resume` 在原工作目录重建为标准 Botmux 会话，无需进程仍在运行、也不用先迁进 tmux
 - **共享模式** — Botmux 接入后，iTerm2 和飞书双向同步：流式卡片实时显示终端输出，飞书聊天框输入直接透传到终端
 - **一键接管** — 点击流式卡片上的「🔄 接管」按钮，Botmux 以 `--resume` 重建会话，转为标准 Botmux 会话
 - **安全断开** — 点击「⏏ 断开」，Botmux 退出观察，原 CLI 不受影响
@@ -199,7 +200,7 @@ CLI 进入 botmux 会话时自动获得 `~/.botmux/bin` 在 PATH 中，以及一
 ## 前置要求
 
 - **Node.js** >= 20
-- **AI 编程 CLI / 本地 Agent 应用** 已安装并完成认证（`claude`、`codex`、`coco`、`cursor-agent`、`gemini`、`opencode`、`hermes`、`seed`（Seed CLI，Claude Code 衍生）、`pi`、`omp`（oh-my-pi，Pi 衍生）、`copilot`（GitHub Copilot CLI）、`traex`（TRAE CLI）或 `agy`（Antigravity）在 PATH 中）
+- **AI 编程 CLI / 本地 Agent 应用** 已安装并完成认证（`claude`、`codex`、`coco`、`cursor-agent`、`gemini`、`opencode`、`hermes`、`seed`（Seed CLI，Claude Code 衍生）、`relay`（Relay CLI，Seed 新版）、`pi`、`omp`（oh-my-pi，Pi 衍生）、`copilot`（GitHub Copilot CLI）、`traex`（TRAE CLI）或 `agy`（Antigravity）在 PATH 中）
   - **CoCo 最低版本 `0.120.32`**：type-ahead（会话忙时即可发新消息，由 CoCo 自己的消息队列接住）依赖 0.120.32+ 的行为；更早版本忙时输入可能丢失或串行，请升级后再用
 - **tmux** >= 3.x（可选，安装后自动启用会话常驻）
 - **CJK 字体**（用于截图渲染中文/emoji）：

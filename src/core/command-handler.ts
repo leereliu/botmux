@@ -7,15 +7,17 @@ import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { getBot, getAllBots, getBotOpenId } from '../bot-registry.js';
+import { repoPickerScanOptions } from '../global-config.js';
 import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
 import { scanProjects, scanMultipleProjects, describeProjectDir } from '../services/project-scanner.js';
 import { createRepoWorktree } from '../services/git-worktree.js';
 import { worktreeSlugFromContextAI } from '../services/worktree-slug-ai.js';
-import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSessionClosedCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildLandCard } from '../im/lark/card-builder.js';
+import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildLandCard } from '../im/lark/card-builder.js';
 import { computeSandboxDiff } from '../services/sandbox-land.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
+import type { CliId, ResumableSession } from '../adapters/cli/types.js';
 import { deleteMessage, sendMessage, sendUserMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, uploadFile } from '../im/lark/client.js';
 import { chatAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { claimPairing } from '../services/pairing-store.js';
@@ -27,13 +29,21 @@ import { validateWorkingDir } from './working-dir.js';
 import { discoverAdoptableSessions, validateAdoptTarget, adoptTargetKey, adoptTargetLabel, type AdoptableSession } from './session-discovery.js';
 import { discoverAdoptableZellijSessions, validateZellijAdoptTarget, type ZellijAdoptableSession } from './zellij-adopt-discovery.js';
 import { listCodexAppThreads, type CodexAppThreadSummary } from '../services/codex-app-threads.js';
-import { generateAuthUrl, getTokenStatus } from '../utils/user-token.js';
+import { generateAuthUrl, getTokenStatus, resolveUserToken, DOC_COMMENT_OAUTH_SCOPES } from '../utils/user-token.js';
+import { resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../im/lark/doc-comment.js';
+import { UserTokenMissingError } from '../im/lark/client.js';
+import {
+  putDocSubscription, removeDocSubscription, listDocSubscriptionsForSession,
+  type CommentTriggerMode,
+} from '../services/doc-subs-store.js';
 import { bindOncall, unbindOncall, getOncallStatus } from '../services/oncall-store.js';
 import {
   CONFIG_FIELDS, findConfigField, settableFieldKeys, parseBooleanValue,
   applyConfigField, setBotAllowedUsers, getConfigSnapshot, getConfigCardData, type ConfigEffect,
 } from '../services/bot-config-store.js';
 import { resolveCliId, findInvalidAllowedUserEntries } from '../setup/bot-config-editor.js';
+import { buildClosedSessionCard } from './closed-session-card.js';
+import { ttadkConfigModelChoices } from '../setup/cli-selection.js';
 import { publishAttentionPatch, announcePendingRepoSession } from './session-activity.js';
 import { setCardMode } from '../services/card-mode-store.js';
 import { canOperate } from '../im/lark/event-dispatcher.js';
@@ -47,7 +57,7 @@ import { t, localeForBot, type Locale } from '../i18n/index.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
-export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help', '/cd', '/repo', '/schedule', '/role', '/botconfig', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/term', '/list-slash-command', '/slash', '/land']);
+export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help', '/cd', '/repo', '/schedule', '/role', '/botconfig', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/term', '/list-slash-command', '/slash', '/land', '/subscribe-lark-doc']);
 
 /**
  * Daemon commands that act on the chat itself rather than opening a
@@ -313,6 +323,7 @@ function invalidConfiguredWorkingDirs(ds: DaemonSession | undefined, larkAppId: 
     workingDirs: config.daemon.workingDirs,
   });
 }
+
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -648,8 +659,14 @@ async function handleConfigCommand(
   const cardLoc = cardLocaleArg(sub);
   if (!sub || cardLoc) {
     const renderLoc: Locale = cardLoc ?? loc;
-    let modelChoices: readonly string[] = [];
-    try { modelChoices = createCliAdapterSync(bot.config.cliId, bot.config.cliPathOverride).modelChoices ?? []; } catch { /* 无候选 → 不渲染 model 下拉 */ }
+    // ttadk 网关 bot：模型候选用 ttadk 网关模型（glm-5.1…），不是底层适配器的
+    // opus/gpt-5（那会被 worker 注入成 `ttadk -m opus` 用错模型启动失败）；CoCo 无候选。
+    // 非 ttadk（返回 null）才回落底层适配器自己的 modelChoices。
+    const ttadkChoices = ttadkConfigModelChoices(bot.config.wrapperCli);
+    let modelChoices: readonly string[] = ttadkChoices ?? [];
+    if (ttadkChoices === null) {
+      try { modelChoices = createCliAdapterSync(bot.config.cliId, bot.config.cliPathOverride).modelChoices ?? []; } catch { /* 无候选 → 不渲染 model 下拉 */ }
+    }
     const data = getConfigCardData(larkAppId, modelChoices);
     if (!data) { await reply(buildConfigHelp(renderLoc)); return; }
     const cardJson = buildConfigCard(data, renderLoc);
@@ -895,33 +912,12 @@ export async function handleCommand(
     switch (cmd) {
       case '/close': {
         if (ds) {
-          const closedSessionId = ds.session.sessionId;
-          const closedTitle = ds.session.title;
-          const botCfg = getBot(ds.larkAppId).config;
-          const closedCliId = ds.session.cliId ?? botCfg.cliId;
-          const closedAnchor = sessionAnchorId(ds);
-          const closedWorkingDir = ds.session.workingDir;
-          const cliResumeCommand = (() => {
-            try {
-              const adapter = createCliAdapterSync(closedCliId, botCfg.cliPathOverride);
-              return adapter.buildResumeCommand?.({
-                sessionId: closedSessionId,
-                cliSessionId: ds.session.cliSessionId,
-              }) ?? null;
-            } catch { return null; }
-          })();
+          // Capture the closed-session card BEFORE killWorker/closeSession —
+          // it reads the live session's identity off `ds`.
+          const card = buildClosedSessionCard(ds, loc);
           killWorker(ds);
-          sessionStore.closeSession(closedSessionId);
+          sessionStore.closeSession(ds.session.sessionId);
           activeSessions.delete(sessionKey(rootId, larkAppId!));
-          const card = buildSessionClosedCard(
-            closedSessionId,
-            closedAnchor,
-            closedTitle,
-            closedCliId,
-            closedWorkingDir,
-            cliResumeCommand,
-            loc,
-          );
           // 「会话已关闭」卡片优先「仅自己可见」：普通群里走 ephemeral 只发给执行
           // /close 的本人；话题群不支持 ephemeral(18053) 时回退为正常的群内可见回复
           // ——与流式卡片上「关闭会话」按钮的送达方式保持一致。
@@ -1135,19 +1131,45 @@ export async function handleCommand(
         // close + recreate the session (mid-session switch). Used by both the
         // numeric `/repo <N>` form and the `/repo <path|name>` form.
         const commitRepoSelection = async (selectedPath: string, displayName: string, how: string) => {
-          ds!.workingDir = selectedPath;
-          ds!.session.workingDir = selectedPath;
-          sessionStore.updateSession(ds!.session);
-
           if (ds!.pendingRepo) {
+            // First spawn: pin the new cwd onto the CURRENT session, then fork.
+            ds!.workingDir = selectedPath;
+            ds!.session.workingDir = selectedPath;
+            sessionStore.updateSession(ds!.session);
             await forkPendingCli(t('cmd.repo.selected_in_pending', { name: displayName }, loc));
           } else {
+            // Safety net: a mid-session `/repo` switch closes the running
+            // session and spawns a fresh one on the SAME anchor. Without a
+            // trace, the old context silently vanishes (relay/adopt/resume all
+            // hit `anchor_occupied` once the new session holds the anchor).
+            // So, before displacing it, post the same "session closed" card
+            // `/close` emits — it keeps the old session visible and carries the
+            // terminal `claude --resume` command. (Its in-card resume button
+            // still hits anchor_occupied while the new session occupies this
+            // anchor — expected; `/close` the new one first, or use the
+            // command.) Mirrors the `/close` case above.
+            //
+            // The new cwd is NOT written onto the old session here — it would
+            // pollute the displaced session's stored workingDir (and the closed
+            // card), so `claude --resume` later would reopen the old context in
+            // the new repo's cwd. The new repo is pinned onto the fresh session
+            // below instead.
+            const closedCard = buildClosedSessionCard(ds!, loc);
             killWorker(ds!);
             sessionStore.closeSession(ds!.session.sessionId);
+            await deliverEphemeralOrReply(
+              ds!,
+              message.senderId,
+              closedCard,
+              'interactive',
+              () => sessionReply(rootId, closedCard, 'interactive'),
+            );
+
             const session = sessionStore.createSession(ds!.chatId, rootId, displayName, ds!.chatType);
             ds!.session = session;
             ds!.lastUserPrompt = undefined;
             ds!.lastCliInput = undefined;
+            ds!.workingDir = selectedPath;
             ds!.session.workingDir = selectedPath;
             ds!.session.larkAppId = ds!.larkAppId;
             sessionStore.updateSession(ds!.session);
@@ -1335,7 +1357,7 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.repo.scan_dir_not_exist', { dirs: scanDirs.join(', ') }, loc));
           break;
         }
-        const projects = scanMultipleProjects(validDirs);
+        const projects = scanMultipleProjects(validDirs, 3, repoPickerScanOptions());
         if (projects.length === 0) {
           await sessionReply(rootId, t('cmd.repo.no_git_repos', { dirs: validDirs.join(', ') }, loc));
           break;
@@ -1454,6 +1476,87 @@ export async function handleCommand(
         break;
       }
 
+      case '/subscribe-lark-doc': {
+        if (!ds || !larkAppId) { await sessionReply(rootId, t('cmd.subdoc.no_session', undefined, loc)); break; }
+        const arg = message.content.replace(/^\/subscribe-lark-doc\s*/i, '').trim();
+        const anchor = sessionAnchorId(ds);
+        const dataDir = config.session.dataDir;
+        const modeLabel = (m: CommentTriggerMode) =>
+          t(m === 'all' ? 'cmd.subdoc.mode_all' : 'cmd.subdoc.mode_mention', undefined, loc);
+
+        if (arg === 'list' || arg === '列表') {
+          const subs = listDocSubscriptionsForSession(dataDir, larkAppId, anchor);
+          if (!subs.length) { await sessionReply(rootId, t('cmd.subdoc.none', undefined, loc)); break; }
+          const lines = subs.map(s => `• ${s.docTitle || s.fileToken}（${modeLabel(s.commentTriggerMode)}）`);
+          await sessionReply(rootId, [t('cmd.subdoc.list_title', undefined, loc), ...lines].join('\n'));
+          break;
+        }
+
+        if (arg === 'off' || arg === 'stop' || arg === '退订') {
+          const subs = listDocSubscriptionsForSession(dataDir, larkAppId, anchor);
+          for (const s of subs) {
+            await unsubscribeDocFile(larkAppId, { fileToken: s.fileToken, fileType: s.fileType });
+            removeDocSubscription(dataDir, larkAppId, s.fileToken);
+          }
+          await sessionReply(rootId, t('cmd.subdoc.unsubscribed', { count: subs.length }, loc));
+          break;
+        }
+
+        if (!arg) { await sessionReply(rootId, t('cmd.subdoc.usage', undefined, loc)); break; }
+
+        // 评论事件官方推荐用户身份订阅，tenant 订阅大概率收不到推送 → 需要带文档 scope
+        // 的 User Token。文档 scope 不在通用 /login 里（避免污染所有 bot 的登录），
+        // 这里按需生成带 DOC_COMMENT_OAUTH_SCOPES 的专用授权链接。
+        const subCfg = getBot(larkAppId).config;
+        const replyDocLogin = async () => {
+          const { authUrl } = generateAuthUrl(subCfg.larkAppId, subCfg.larkAppSecret, normalizeBrand(subCfg.brand), DOC_COMMENT_OAUTH_SCOPES);
+          await sessionReply(rootId, [
+            t('cmd.subdoc.need_login', undefined, loc),
+            '',
+            t('cmd.login.step1', undefined, loc),
+            authUrl,
+            '',
+            t('cmd.login.step2', undefined, loc),
+            t('cmd.login.step3', undefined, loc),
+          ].join('\n'));
+        };
+        const userTok = await resolveUserToken(subCfg.larkAppId, subCfg.larkAppSecret, normalizeBrand(subCfg.brand));
+        if (!userTok) { await replyDocLogin(); break; }
+
+        try {
+          const file = await resolveDocFile(larkAppId, arg);
+          await subscribeDocFile(larkAppId, file);
+          const mode: CommentTriggerMode = subCfg.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only';
+          const { previous } = putDocSubscription(dataDir, larkAppId, {
+            fileToken: file.fileToken,
+            fileType: file.fileType,
+            sessionAnchor: anchor,
+            sessionId: ds.session.sessionId,
+            scope: ds.scope,
+            chatId: ds.chatId,
+            commentTriggerMode: mode,
+            ownerOpenId: message.senderId,
+            createdAt: Date.now(),
+          });
+          const title = file.fileToken.slice(0, 12);
+          const rebound = previous && previous.sessionAnchor !== anchor;
+          await sessionReply(rootId, t(
+            rebound ? 'cmd.subdoc.subscribed_moved' : 'cmd.subdoc.subscribed',
+            { title, mode: modeLabel(mode) },
+            loc,
+          ));
+          logger.info(`[${logTag}] /subscribe-lark-doc → ${file.fileType}:${file.fileToken.slice(0, 12)} mode=${mode}${rebound ? ' (rebound)' : ''}`);
+        } catch (err) {
+          // token 缺失 / 失效 / 缺文档 scope（403）→ 给带文档 scope 的重新授权链接。
+          if (err instanceof UserTokenMissingError) {
+            await replyDocLogin();
+          } else {
+            await sessionReply(rootId, t('cmd.subdoc.failed', { err: err instanceof Error ? err.message : String(err) }, loc));
+          }
+        }
+        break;
+      }
+
       case '/adopt': {
         const adoptArgs = message.content.replace(/^\/adopt\s*/i, '').trim();
         if (ds?.adoptedFrom) {
@@ -1487,7 +1590,13 @@ export async function handleCommand(
           ...discoverAdoptableZellijSessions(botCliId),
         ];
 
-        if (sessions.length === 0) {
+        // Second filter: sessions resumable from disk (paseo-style import).
+        // Only the bot's OWN CLI is offered (resume needs that CLI's binary).
+        const resumable = botCliId
+          ? await discoverResumableSessionsForBot(botCliId, botCfgForAdopt?.cliPathOverride, activeSessions)
+          : [];
+
+        if (sessions.length === 0 && resumable.length === 0) {
           await sessionReply(rootId, t('cmd.adopt.no_sessions', undefined, loc));
           break;
         }
@@ -1502,15 +1611,21 @@ export async function handleCommand(
               ? `${s.zellijSession}:${s.zellijPaneId}` === zellijNorm
               : adoptTargetLabel(s) === directTarget || adoptTargetKey(s) === directTarget || s.tmuxTarget === directTarget || s.herdrPaneId === directTarget,
           );
-          if (!target) {
-            await sessionReply(rootId, t('cmd.adopt.pane_not_found', { pane: directTarget }, loc));
+          if (target) {
+            if (ds) await startAdoptSession(target, ds, deps, larkAppId);
             break;
           }
-          if (ds) await startAdoptSession(target, ds, deps, larkAppId);
+          // Fall back to a resumable session matched by its CLI-native id.
+          const resumeTarget = resumable.find(r => r.cliSessionId === directTarget);
+          if (resumeTarget) {
+            if (ds) await startResumeImportSession(resumeTarget, ds, deps, larkAppId);
+            break;
+          }
+          await sessionReply(rootId, t('cmd.adopt.pane_not_found', { pane: directTarget }, loc));
           break;
         }
 
-        const cardJson = buildAdoptSelectCard(sessions, rootId, loc);
+        const cardJson = buildAdoptSelectCard(sessions, rootId, loc, resumable);
         await sessionReply(rootId, cardJson, 'interactive');
         break;
       }
@@ -2300,6 +2415,7 @@ export async function handleCommand(
           t('help.status', undefined, loc),
           t('help.card', undefined, loc),
           t('help.term', undefined, loc),
+          t('help.subscribe_doc', undefined, loc),
           '',
           t('help.heading_passthrough', { cliName }, loc),
           // 直接从集合渲染，保证文案与 PASSTHROUGH_COMMANDS 不漂移
@@ -2479,4 +2595,68 @@ export async function startAdoptSession(
 
   const cliName = getCliDisplayName(target.cliId);
   await sessionReply(sessionAnchorId(ds), t('cmd.adopt.success', { cliName, project, pane }, loc));
+}
+
+/** Discover the sessions resumable from disk for `cliId`, excluding any whose
+ *  CLI-native id is already live in a botmux session (so a session botmux
+ *  already runs isn't offered for re-import). Returns [] when the adapter has
+ *  no on-disk store. */
+export async function discoverResumableSessionsForBot(
+  cliId: CliId,
+  cliPathOverride: string | undefined,
+  activeSessions: Map<string, DaemonSession>,
+  limit = 20,
+): Promise<ResumableSession[]> {
+  let adapter: ReturnType<typeof createCliAdapterSync>;
+  try { adapter = createCliAdapterSync(cliId, cliPathOverride); } catch { return []; }
+  if (!adapter.listResumableSessions) return [];
+  // Exclude every session botmux already manages — live OR closed — so the
+  // picker surfaces only genuinely external sessions (a CLI the user ran
+  // standalone). botmux's own closed sessions stay resumable via their
+  // session-closed cards, so hiding them here avoids a redundant, confusing
+  // duplicate. The identity set spans all bot stores and includes both the
+  // botmux sessionId (= the claude jsonl filename) and the cliSessionId
+  // (codex/traex rollout id), covering every CLI's id shape. Passed INTO the
+  // adapter so exclusion happens BEFORE the `limit` truncation.
+  const exclude = sessionStore.collectBotmuxSessionIdentities() ?? new Set<string>();
+  // Belt-and-suspenders: also fold in the in-memory active map (freshest).
+  for (const ds of activeSessions.values()) {
+    if (ds.session.sessionId) exclude.add(ds.session.sessionId);
+    if (ds.session.cliSessionId) exclude.add(ds.session.cliSessionId);
+  }
+  try {
+    return await adapter.listResumableSessions({ limit, exclude });
+  } catch {
+    return [];
+  }
+}
+
+/** Import (resume) a stored session into the current topic: re-spawn the bot's
+ *  CLI via `--resume <cliSessionId>` in `cwd`. Mirrors the manual resume path —
+ *  the worker owns the CLI (NOT an observe-adopt), so no `adoptedFrom` is set. */
+export async function startResumeImportSession(
+  target: ResumableSession,
+  ds: DaemonSession,
+  deps: CommandHandlerDeps,
+  larkAppId?: string,
+): Promise<void> {
+  const sessionReply = (rid: string, content: string, msgType?: string) =>
+    deps.sessionReply(rid, content, msgType, larkAppId);
+  const loc: Locale = localeForBot(ds.larkAppId ?? larkAppId);
+  const project = target.cwd.split('/').pop() || target.cwd;
+
+  ds.workingDir = target.cwd;
+  ds.session.workingDir = target.cwd;
+  ds.session.cliSessionId = target.cliSessionId;
+  ds.session.title = target.title || `Import: ${project}`;
+  // Resume sandbox decision is left to forkWorker (resume=true → not sandboxed,
+  // matching restore semantics). Mark history so the session is treated as a
+  // resume, not a fresh spawn.
+  ds.hasHistory = true;
+  sessionStore.updateSession(ds.session);
+
+  forkWorker(ds, '', true);
+
+  const cliName = getCliDisplayName(getBot(ds.larkAppId).config.cliId);
+  await sessionReply(sessionAnchorId(ds), t('cmd.adopt.resume_success', { cliName, project, title: target.title || target.cliSessionId.slice(0, 8) }, loc));
 }

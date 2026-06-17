@@ -140,19 +140,14 @@ describe('claude-code buildArgs', () => {
     expect(parsed.permissions.defaultMode).toBe('bypassPermissions');
   });
 
-  it('omits dangerous permission flags/keys when disableCliBypass is true (but keeps the SessionStart ready hook)', () => {
+  it('omits dangerous permission flags/keys AND --settings entirely when disableCliBypass is true', () => {
     const args = adapter.buildArgs({ sessionId: 's', resume: false, disableCliBypass: true });
     expect(args).not.toContain('--dangerously-skip-permissions');
     expect(args).toContain('--disallowed-tools');
-    // --settings is still emitted — it now also carries the SessionStart真就绪
-    // hook, which must be injected unconditionally (else the worker ready-gate
-    // would wait out its fallback timeout). But the bypass keys are gone.
-    const idx = args.indexOf('--settings');
-    expect(idx).toBeGreaterThanOrEqual(0);
-    const parsed = JSON.parse(args[idx + 1]);
-    expect(parsed.skipDangerousModePermissionPrompt).toBeUndefined();
-    expect(parsed.permissions).toBeUndefined();
-    expect(parsed.hooks?.SessionStart?.[0]?.hooks?.[0]?.command).toContain('session-ready');
+    // SessionStart 就绪 hook 改走全局 settings.json（见 hookInstall.sessionStartCommand），
+    // 不再注入进程级 --settings；bypass 键也没有 → 没东西可传 → 干脆不带 --settings。
+    expect(args).not.toContain('--settings');
+    expect(adapter.hookInstall?.sessionStartCommand).toContain('session-ready');
   });
 
   it('ignores initialPrompt (not passed via args)', () => {
@@ -741,6 +736,21 @@ describe('completionPattern', () => {
     expect(createHermesAdapter('/bin/hermes').completionPattern).toBeUndefined();
   });
 
+  it('hermes readyPattern matches the ❯ prompt symbol', () => {
+    // Hermes TUI's prompt_symbol is "❯" (see skin_engine.py: prompt_symbol).
+    // We match it so the IdleDetector can fire idle as soon as the input box
+    // appears, instead of waiting 2s quiescence + 3s spinner-guard. Mirrors
+    // claude-code.ts:840 which also uses /❯/. This regression test guards
+    // against someone "tidying" the field back to undefined.
+    const p = createHermesAdapter('/bin/hermes').readyPattern;
+    expect(p).toBeInstanceOf(RegExp);
+    expect(p!.test('…spinner ⟪⚔ ▲✢\n\n  ❯ ')).toBe(true);
+    // Must not false-positive on common decorative characters used elsewhere
+    // in the TUI.
+    expect(p!.test('┊ 🌐 preparing browser_navigate…')).toBe(false);
+    expect(p!.test('·')).toBe(false);
+  });
+
   it('pi has no completionPattern', () => {
     expect(createPiAdapter('/bin/pi').completionPattern).toBeUndefined();
   });
@@ -812,8 +822,17 @@ describe('readyPattern', () => {
     expect(createMtrAdapter('/bin/mtr').readyPattern).toBeUndefined();
   });
 
-  it('hermes has no readyPattern', () => {
-    expect(createHermesAdapter('/bin/hermes').readyPattern).toBeUndefined();
+  it('hermes readyPattern is set (Hermes TUI exposes ❯ as the prompt symbol)', () => {
+    // Previously undefined — that forced every Hermes turn to wait the full
+    // 2s quiescence + 3s spinner-guard cycle before botmux could deliver the
+    // next user message, which compounded across parallel sessions to 2-3
+    // minute delays. Setting readyPattern to /❯/ brings Hermes in line with
+    // claude-code/codex-app and recovers the same prompt-detection path they
+    // already use. The "matches ❯" assertion lives in the dedicated test
+    // below; this one is a coarse regression guard so the field cannot be
+    // silently cleared back to undefined.
+    const p = createHermesAdapter('/bin/hermes').readyPattern;
+    expect(p).toBeInstanceOf(RegExp);
   });
 
   it('pi has no readyPattern', () => {

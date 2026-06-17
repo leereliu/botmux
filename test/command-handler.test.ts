@@ -44,6 +44,13 @@ vi.mock('../src/config.js', () => ({
   },
 }));
 
+vi.mock('../src/global-config.js', () => ({
+  readGlobalConfig: vi.fn(() => ({})),
+  // repoPickerScanOptions is the shared helper command-handler depends on;
+  // default to legacy (include worktrees), overridden per-test.
+  repoPickerScanOptions: vi.fn(() => ({ includeWorktrees: true })),
+}));
+
 // Mock role/profile stores so /role routing tests assert on calls (no real FS).
 vi.mock('../src/core/role-resolver.js', () => ({
   writeRoleFile: vi.fn(),
@@ -102,6 +109,7 @@ vi.mock('../src/services/session-store.js', () => ({
     chatType,
   })),
   updateSession: vi.fn(),
+  collectBotmuxSessionIdentities: vi.fn(() => new Set<string>()),
 }));
 
 vi.mock('../src/services/schedule-store.js', () => ({
@@ -357,13 +365,14 @@ import * as sessionStore from '../src/services/session-store.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
 import * as scheduler from '../src/core/scheduler.js';
 import { deleteMessage, sendMessage, listChatBotMembers } from '../src/im/lark/client.js';
-import { buildSlashListCard } from '../src/im/lark/card-builder.js';
+import { buildSlashListCard, buildSessionClosedCard } from '../src/im/lark/card-builder.js';
 import { createGroupWithBots } from '../src/services/group-creator.js';
 import { getAllBots, getBot } from '../src/bot-registry.js';
 import { generateAuthUrl, getTokenStatus } from '../src/utils/user-token.js';
 import { bindOncall } from '../src/services/oncall-store.js';
 import { existsSync, statSync, readFileSync } from 'node:fs';
 import { scanMultipleProjects } from '../src/services/project-scanner.js';
+import { repoPickerScanOptions } from '../src/global-config.js';
 import { createRepoWorktree } from '../src/services/git-worktree.js';
 import { discoverAdoptableSessions } from '../src/core/session-discovery.js';
 import { listCodexAppThreads } from '../src/services/codex-app-threads.js';
@@ -474,7 +483,7 @@ function mockCodexAppBot(): void {
 
 describe('DAEMON_COMMANDS set', () => {
   it('should contain all expected commands', () => {
-    const expected = ['/close', '/restart', '/status', '/help', '/cd', '/repo', '/schedule', '/role', '/botconfig', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/list-slash-command', '/slash', '/land'];
+    const expected = ['/close', '/restart', '/status', '/help', '/cd', '/repo', '/schedule', '/role', '/botconfig', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/term', '/list-slash-command', '/slash', '/land'];
     for (const cmd of expected) {
       expect(DAEMON_COMMANDS.has(cmd), `Expected DAEMON_COMMANDS to contain ${cmd}`).toBe(true);
     }
@@ -495,8 +504,9 @@ describe('DAEMON_COMMANDS set', () => {
   });
 
   it('should have the correct size', () => {
-    // 23 = 21 original + /land (sandbox-landing) + /term (operable-terminal slash).
-    expect(DAEMON_COMMANDS.size).toBe(23);
+    // 24 = 21 original + /land (sandbox-landing) + /term (operable-terminal slash)
+    //      + /subscribe-lark-doc (Feishu doc comment entry).
+    expect(DAEMON_COMMANDS.size).toBe(24);
   });
 
   it('contains the /list-slash-command lister and its /slash alias', () => {
@@ -695,6 +705,9 @@ describe('handleCommand', () => {
     vi.clearAllMocks();
     vi.mocked(getBot).mockImplementation(defaultGetBot as any);
     vi.mocked(listCodexAppThreads).mockResolvedValue([]);
+    // clearAllMocks wipes the factory default — restore legacy (include
+    // worktrees) so /repo scan tests aren't passed `undefined` options.
+    vi.mocked(repoPickerScanOptions).mockReturnValue({ includeWorktrees: true });
   });
 
   // ─── /close ─────────────────────────────────────────────────────────────
@@ -734,6 +747,33 @@ describe('handleCommand', () => {
       const cardJson = replyArgs[1] as string;
       expect(cardJson).toContain('botmux resume');
       expect(cardJson).toContain('"action":"resume"');
+    });
+
+    it('keeps ttadk non-interactive flags in the closed-card resume command', async () => {
+      // A ttadk × Claude bot: the manual resume command on the closed card must
+      // carry `-m <model> --skip-check`, else copy-pasting it hits ttadk's model
+      // picker. Verifies the /close construction passes { ttadkModel: bot.model }
+      // (not just the decorateResumeForWrapper helper in isolation).
+      vi.mocked(getBot).mockImplementation(((id: string = 'app-1') => ({
+        botName: 'Claude',
+        config: {
+          larkAppId: id,
+          larkAppSecret: 'secret-1',
+          cliId: 'claude-code' as const,
+          wrapperCli: 'ttadk claude',
+          model: 'glm-5.1',
+          workingDir: '~/projects',
+          workingDirs: ['~/projects'],
+        },
+      })) as any);
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+
+      await handleCommand('/close', ROOT_ID, makeLarkMessage('/close'), deps, LARK_APP_ID);
+
+      // 6th positional arg to buildSessionClosedCard is the cliResumeCommand.
+      const resumeArg = vi.mocked(buildSessionClosedCard).mock.calls[0]?.[5];
+      expect(resumeArg).toBe('ttadk claude -m glm-5.1 --skip-check --resume sess-001');
     });
 
     it('should reply with no-session message when session does not exist', async () => {
@@ -1124,6 +1164,25 @@ describe('handleCommand', () => {
         'interactive',
         LARK_APP_ID,
         'msg_001',
+      );
+    });
+
+    it('should omit worktrees from the project list when global repoPickerMode is repos', async () => {
+      vi.mocked(existsSync).mockReturnValue(true);
+      vi.mocked(repoPickerScanOptions).mockReturnValue({ includeWorktrees: false });
+      vi.mocked(scanMultipleProjects).mockReturnValue([
+        { name: 'proj', path: '/home/testuser/proj', branch: 'main' },
+      ]);
+
+      const ds = makeDaemonSession({ worker: null });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), deps, LARK_APP_ID);
+
+      expect(scanMultipleProjects).toHaveBeenCalledWith(
+        ['/home/testuser'],
+        3,
+        { includeWorktrees: false },
       );
     });
 

@@ -9,7 +9,7 @@
  *
  * Run:  pnpm vitest run test/card-handler-repo-select.test.ts
  */
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 // ─── Mocks (before importing the module under test) ───────────────────────
 
@@ -110,13 +110,16 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 // ─── Imports ──────────────────────────────────────────────────────────────
 
 import { handleCardAction, type CardHandlerDeps } from '../src/im/lark/card-handler.js';
-import { forkWorker, killWorker } from '../src/core/worker-pool.js';
+import { forkWorker, killWorker, deliverEphemeralOrReply } from '../src/core/worker-pool.js';
 import { getAvailableBots } from '../src/core/session-manager.js';
 import { createSession, closeSession } from '../src/services/session-store.js';
 import { createRepoWorktree } from '../src/services/git-worktree.js';
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { ProjectInfo } from '../src/services/project-scanner.js';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { basename, join } from 'node:path';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
@@ -170,6 +173,17 @@ function makeSelectEvent(key: 'repo_switch' | 'repo_worktree', path: string) {
   };
 }
 
+function makeManualEvent(path: string, operator = OWNER) {
+  return {
+    operator: { open_id: operator },
+    action: {
+      value: { action: 'repo_manual_submit', root_id: ROOT_ID },
+      form_value: { repo_manual_path: path },
+    },
+    context: { open_message_id: 'om_card' },
+  };
+}
+
 function deferred<T>() {
   let resolve!: (v: T) => void;
   let reject!: (e: unknown) => void;
@@ -207,10 +221,13 @@ describe('repo select card — plain switch', () => {
     expect(vi.mocked(forkWorker).mock.calls[0]![1]).toBe('mock-prompt');
     expect(sessionReply.mock.calls.map(c => c[1]).join()).toContain('已选择');
     expect(killWorker).not.toHaveBeenCalled();
+    // First-spawn (pendingRepo) closes nothing, so no "session closed" card.
+    expect(deliverEphemeralOrReply).not.toHaveBeenCalled();
   });
 
   it('mid-session selection closes the old session and forks a fresh one', async () => {
     const ds = makeDs(); // no pendingRepo
+    ds.session.workingDir = '/repos/gamma'; // old session's actual repo
     const { deps, sessionReply } = makeDeps(ds);
 
     await handleCardAction(makeSelectEvent('repo_switch', '/repos/beta'), deps, APP_ID);
@@ -218,10 +235,20 @@ describe('repo select card — plain switch', () => {
     expect(killWorker).toHaveBeenCalledTimes(1);
     expect(closeSession).toHaveBeenCalledWith('uuid-old');
     expect(ds.session.sessionId).toMatch(/^uuid-new-/);
+    expect(ds.workingDir).toBe('/repos/beta');
     expect(ds.session.workingDir).toBe('/repos/beta');
     expect(forkWorker).toHaveBeenCalledTimes(1);
     expect(vi.mocked(forkWorker).mock.calls[0]![1]).toBe('');
     expect(sessionReply.mock.calls.map(c => c[1]).join()).toContain('已切换');
+    // The displaced session gets a "session closed" card (Option C safety net)
+    // so its context stays visible/recoverable instead of vanishing silently.
+    expect(deliverEphemeralOrReply).toHaveBeenCalledTimes(1);
+    const closedCard = vi.mocked(deliverEphemeralOrReply).mock.calls[0]![2] as string;
+    expect(closedCard).toContain('uuid-old');
+    // Regression guard: the closed card must carry the OLD session's repo, NOT
+    // the switch target — otherwise `claude --resume` reopens it in the wrong cwd.
+    expect(closedCard).toContain('gamma');
+    expect(closedCard).not.toContain('beta');
   });
 });
 
@@ -248,7 +275,11 @@ describe('repo select card — worktree open', () => {
     expect(ds.workingDir).toBe('/repos/alpha-wt-1');
     expect(ds.session.workingDir).toBe('/repos/alpha-wt-1');
     expect(ds.pendingRepo).toBe(false);
-    expect(sessionReply.mock.calls.map(c => c[1]).join()).toContain('worktree 已创建');
+    const replies = sessionReply.mock.calls.map(c => c[1]).join();
+    expect(replies).toContain('worktree 已创建');
+    // The redundant "已选择" confirmation is suppressed in the worktree flow —
+    // the "worktree 已创建：…" line above is the single message the user sees.
+    expect(replies).not.toContain('已选择');
   });
 
   it('blocks a plain switch while git runs — and does NOT commit when the session moved on out-of-band', async () => {
@@ -404,5 +435,75 @@ describe('repo select card — worktree open', () => {
     expect(forkWorker).not.toHaveBeenCalled();
     expect(ds.pendingRepo).toBe(true); // still recoverable — card stays
     expect(sessionReply.mock.calls.map(c => c[1]).join()).toContain('fetch blew up');
+  });
+});
+
+describe('repo select card — manual directory entry', () => {
+  let tmpDir: string;
+  beforeEach(() => { tmpDir = mkdtempSync(join(tmpdir(), 'botmux-manual-repo-')); });
+  afterEach(() => { rmSync(tmpDir, { recursive: true, force: true }); });
+
+  it('pendingRepo manual submit forks the CLI in the typed directory', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'queued task', worker: null });
+    const { deps, sessionReply } = makeDeps(ds);
+
+    await handleCardAction(makeManualEvent(tmpDir), deps, APP_ID);
+
+    expect(ds.pendingRepo).toBe(false);
+    expect(ds.workingDir).toBe(tmpDir);
+    expect(ds.session.workingDir).toBe(tmpDir);
+    expect(forkWorker).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(forkWorker).mock.calls[0]![1]).toBe('mock-prompt');
+    const reply = sessionReply.mock.calls.map(c => c[1]).join();
+    expect(reply).toContain('已选择');
+    expect(reply).toContain(basename(tmpDir));
+    expect(killWorker).not.toHaveBeenCalled();
+  });
+
+  it('mid-session manual submit closes the old session and forks a fresh one', async () => {
+    const ds = makeDs(); // no pendingRepo
+    const { deps, sessionReply } = makeDeps(ds);
+
+    await handleCardAction(makeManualEvent(tmpDir), deps, APP_ID);
+
+    expect(killWorker).toHaveBeenCalledTimes(1);
+    expect(closeSession).toHaveBeenCalledWith('uuid-old');
+    expect(ds.session.sessionId).toMatch(/^uuid-new-/);
+    expect(ds.session.workingDir).toBe(tmpDir);
+    expect(forkWorker).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls.map(c => c[1]).join()).toContain('已切换');
+  });
+
+  it('rejects a non-existent path with an error toast and does not fork', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null });
+    const { deps } = makeDeps(ds);
+
+    const res = await handleCardAction(makeManualEvent(join(tmpDir, 'nope-does-not-exist')), deps, APP_ID);
+
+    expect(res?.toast?.type).toBe('error');
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(ds.pendingRepo).toBe(true); // recoverable — card stays
+  });
+
+  it('rejects an empty path with an error toast and does not fork', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null });
+    const { deps } = makeDeps(ds);
+
+    const res = await handleCardAction(makeManualEvent('   '), deps, APP_ID);
+
+    expect(res?.toast?.type).toBe('error');
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(ds.pendingRepo).toBe(true);
+  });
+
+  it('blocks a manual submit while a worktree creation holds the commit lock', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null, worktreeCreating: true });
+    const { deps } = makeDeps(ds);
+
+    const res = await handleCardAction(makeManualEvent(tmpDir), deps, APP_ID);
+
+    expect(res?.toast?.content).toContain('已有一个 worktree 正在创建');
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(ds.pendingRepo).toBe(true);
   });
 });

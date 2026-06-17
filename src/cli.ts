@@ -7,7 +7,7 @@
  *   botmux setup --no-open-platform-auto — skip Feishu Open Platform automation
  *   botmux start          — start daemon (pm2)
  *   botmux stop           — stop daemon
- *   botmux restart        — restart daemon (auto-restores sessions)
+ *   botmux restart [--include-pm2] — restart daemon (optionally restart PM2 God too)
  *   botmux logs [--lines] — view daemon logs
  *   botmux status         — show daemon status
  *   botmux upgrade        — upgrade to latest version
@@ -18,7 +18,7 @@
  *   botmux autostart enable|disable|status — manage boot-time autostart (launchd / user systemd)
  *   botmux worker-budget status|set|unset — inspect/override idle worker suspension budget
  */
-import { execSync, spawnSync, spawn } from 'node:child_process';
+import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, appendFileSync, statSync, unlinkSync } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname, basename } from 'node:path';
@@ -28,7 +28,7 @@ import { createInterface } from 'node:readline';
 import { createRequire } from 'node:module';
 import { createHmac, randomBytes } from 'node:crypto';
 import { validateWorkingDir } from './core/working-dir.js';
-import { findAncestorSessionContext as findAncestorSessionContextFromMarkers } from './core/session-marker.js';
+import { resolveSessionContext } from './core/session-marker.js';
 import { parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, offTopicSubBotTopic, resolveReportTarget, resolveSendTarget } from './core/dispatch.js';
 import { enableAutostart, disableAutostart, autostartStatus, refreshAutostart } from './autostart.js';
 import { tmuxEnv } from './setup/ensure-tmux.js';
@@ -47,13 +47,17 @@ import {
   hasOwnerEntry,
   type BotConfigEditInput,
 } from './setup/bot-config-editor.js';
+import { resolveCliSelection, selectionKeyForBot } from './setup/cli-selection.js';
+import { pickCliSelection } from './setup/interactive-select.js';
 import { buildPreset, serializePreset, presetFilename } from './setup/agent-preset.js';
 import type { CliId } from './adapters/cli/types.js';
-import { createCliAdapterSync } from './adapters/cli/registry.js';
 import { logger } from './utils/logger.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional } from './cli/arg-utils.js';
 import { dispatchPrimaryMessage, findStdinAliasAttachment, sendFileAttachments } from './cli/send-dispatch.js';
+import { buildPm2SpawnCommand } from './cli/pm2-command.js';
+import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
+import { rejectLikelyWindowsStdinMojibake } from './cli/stdin-encoding.js';
 import {
   formatBotInfoEntriesForCli,
   formatChatBotsForCli,
@@ -322,66 +326,6 @@ function printInputHelp(title: string, lines: string[]): void {
   for (const line of lines) {
     console.log(`  ${line}`);
   }
-}
-
-/**
- * 读取指定 CLI 适配器声明的候选 model 列表 —— 不支持 model 配置的 CLI（aiden/
- * antigravity/mtr 等没声明 modelChoices）返回 null，promptModel 据此整段
- * 跳过提问。适配器解析失败也按"不支持"处理，避免在 setup 中冒出陌生堆栈。
- */
-function cliModelChoices(cliId: CliId): readonly string[] | null {
-  try {
-    const adapter = createCliAdapterSync(cliId);
-    return adapter.modelChoices && adapter.modelChoices.length > 0
-      ? adapter.modelChoices
-      : null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * 询问"指定 CLI 用哪个 model"。
- *   - cliId 对应的 adapter 没声明 modelChoices → return undefined（跳过提问）
- *   - 用户输入序号 → 取候选列表对应项
- *   - 输入空 + 提供 current → 保留当前值（current 透传出去）
- *   - 输入空 + 无 current → return undefined（用 CLI 默认）
- *   - 输入 `-` → return null（语义：清空，调用方据此 delete model 字段）
- *   - 输入自由文本 → 原样返回
- */
-async function promptModel(
-  rl: ReturnType<typeof createInterface>,
-  cliId: CliId,
-  current?: string,
-): Promise<string | null | undefined> {
-  const choices = cliModelChoices(cliId);
-  if (!choices) return undefined;
-
-  const numbered = choices.map((m, i) => `${i + 1}) ${m}`).join('  ');
-  printInputHelp(`CLI Model（${cliId}）`, [
-    '可选。在 spawn CLI 时注入 model 参数；同一 CLI 配多个 bot 可以跑不同 model。',
-    `候选: ${numbered}  ${choices.length + 1}) Other（自定义输入）`,
-    current
-      ? '留空保留当前值；输入 - 清空（回到 CLI 默认）。'
-      : '留空 = 不设置（用 CLI 默认）。',
-  ]);
-  const label = current ? formatOptionalValue(current) : '未设置';
-  const raw = (await ask(rl, `CLI Model [${label}]: `)).trim();
-  if (!raw) return current ?? undefined;
-  if (raw === '-') return null;
-
-  const numIdx = Number(raw);
-  if (Number.isInteger(numIdx) && numIdx >= 1 && numIdx <= choices.length) {
-    return choices[numIdx - 1];
-  }
-  if (Number.isInteger(numIdx) && numIdx === choices.length + 1) {
-    // 选了 Other，进一步要 free-form
-    const customRaw = (await ask(rl, '请输入 model 名: ')).trim();
-    if (!customRaw) return current ?? undefined;
-    return customRaw;
-  }
-  // 直接当成自由输入
-  return raw;
 }
 
 // Thin wrapper around setup/bots-store.writeBotsJsonAtomic so call-sites keep
@@ -661,23 +605,28 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
   }
   console.log('✅ 凭证有效（tenant_access_token 已成功获取）\n');
 
-  console.log('支持的 CLI: 1) claude-code  2) aiden  3) coco（别名 traecli）  4) codex  5) cursor  6) gemini  7) opencode  8) antigravity  9) mtr  10) hermes  11) codex-app  12) mira  13) seed  14) traex  15) pi  16) copilot  17) oh-my-pi');
-  const cliChoice = await ask(rl, 'CLI 适配器 [1]: ');
+  // CLI 适配器：可搜索的级联选择器（选 Aiden 可进 × Claude / × Codex，aiden 网关）。
+  // 非交互终端自动回退为序号 / ID 文本输入。
+  const selKey = await pickCliSelection(rl, { title: '选择 CLI 适配器' });
   let cliId: CliId;
+  let wrapperCli: string | undefined;
   try {
-    cliId = resolveCliId(cliChoice) ?? 'claude-code';
+    const sel = resolveCliSelection(selKey ?? 'claude-code');
+    cliId = sel.cliId;
+    wrapperCli = sel.wrapperCli;
   } catch (err: any) {
     console.log(`\n❌ ${err?.message ?? String(err)}`);
     console.log('   不写 bots.json。请重新运行 botmux setup。');
     return null;
   }
   const workingDir = await ask(rl, '默认工作目录 [~]: ');
-  const modelChoice = await promptModel(rl, cliId);
 
   const bot: Record<string, any> = {
     larkAppId: creds.appId,
     larkAppSecret: creds.appSecret,
     cliId,
+    // aiden × claude/codex 等启动前缀；普通 CLI 不写此字段。
+    ...(wrapperCli ? { wrapperCli } : {}),
     // 总是写 workingDir, 留空用 '~'. 用户手动编辑 bots.json 时一眼能看到字段
     // 在哪儿, 不用去 README 查字段名.
     workingDir: workingDir.trim() || '~',
@@ -688,10 +637,8 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
   if (creds.brand === 'lark') {
     bot.brand = 'lark';
   }
-  // modelChoice === undefined → 该 CLI 没声明候选 / 用户跳过；不写 model 字段
-  if (typeof modelChoice === 'string' && modelChoice) {
-    bot.model = modelChoice;
-  }
+  // setup 不再询问 model（用户常选到无权限的 model，setup 完一发消息就 spawn
+  // 报错，排查成本高）。需要指定 model 走 /config 卡片或手动编辑 bots.json。
   // 扫码场景默认填扫码人自己 (registerApp 返回里有 open_id), 天然就是 owner.
   // 优先解析成 union_id (on_，跨应用稳定)；失败则 fallback 到 open_id (ou_)。
   // 手动 fallback 场景没 open_id —— 必须显式指定 owner, 否则配置无 owner:
@@ -763,42 +710,39 @@ async function promptEditBotConfig(
   ]);
   input.larkAppSecret = await ask(rl, `LARK_APP_SECRET [保留当前值]: `);
 
-  console.log('\n支持的 CLI: 1) claude-code  2) aiden  3) coco（别名 traecli）  4) codex  5) cursor  6) gemini  7) opencode  8) antigravity  9) mtr  10) hermes  11) codex-app  12) mira  13) seed  14) traex  15) pi  16) copilot  17) oh-my-pi');
+  // CLI 适配器：可搜索的级联选择器（选 Aiden 可进 × Claude / × Codex，aiden 网关）。
   printInputHelp('CLI 适配器', [
-    '选择 botmux 需要套用哪一种 CLI 参数协议和会话恢复方式。',
-    'coco 的别名 traecli 走同一适配器；二进制名是 traecli 也选 coco 即可。',
-    '留空保留当前值；可以输入序号，也可以直接输入适配器 ID。',
+    '可搜索的交互式选择：输入关键字过滤、↑/↓ 选择、⏎ 确认、Esc 保留当前值。',
+    '选 Aiden 进二级菜单：× Claude / × Codex（aiden 网关，无需 wrapper 脚本）。',
+    '非交互终端下回退为「输入序号 / 适配器 ID」。',
   ]);
-  input.cliChoice = await ask(rl, `CLI 适配器 [${bot.cliId ?? 'claude-code'}]: `);
+  const currentKey = selectionKeyForBot(bot.cliId ?? 'claude-code', bot.wrapperCli);
+  const selKey = await pickCliSelection(rl, { title: 'CLI 适配器', currentKey });
+  if (selKey) {
+    try {
+      const sel = resolveCliSelection(selKey);
+      input.cliChoice = sel.cliId;
+      input.wrapperCli = sel.wrapperCli ?? null; // 选普通 CLI 时清掉旧的 aiden×* 前缀
+    } catch (err: any) {
+      console.log(`\n❌ ${err?.message ?? String(err)}（保留当前 CLI）`);
+    }
+  }
+  // selKey 为 null（Esc / 空）→ input.cliChoice 不设 → 保留当前 CLI。
 
   printInputHelp('CLI 可执行文件路径覆盖', [
     '可选。CLI 入口的绝对路径，用于在原 CLI 外面套一层 wrapper / router。',
-    '典型场景：ccr (Claude Code Router) / claude-w / aiden-x-claude 等自定义入口。',
+    '典型场景：ccr / claude-w 等自定义入口（aiden × claude/codex 选上面那项即可，无需此项）。',
     '留空保留当前值；输入 - 清空覆盖，回到 PATH 查 cliId 对应的默认二进制。',
   ]);
   input.cliPathOverride = await ask(rl, `CLI 可执行文件路径覆盖 [${formatOptionalValue(bot.cliPathOverride)}]: `);
 
-  // promptModel 返回 string | null | undefined，直接灌进 BotConfigEditInput.model:
-  //   undefined = 用户跳过 / adapter 不支持 → applyBotConfigEdits 不改 model
-  //   null      = 用户输 `-` 清空 → delete model
-  //   string    = 设值
-  // 用本轮编辑后的 cliId 而非 bot.cliId —— 用户可能刚换了 CLI。
-  const effectiveCliIdForModel = (resolveCliId(input.cliChoice) ?? bot.cliId ?? 'claude-code') as CliId;
+  // setup 不再询问 model（同 promptBotConfig 的理由）。但切换 CLI 时旧 model
+  // 是上一个 CLI 的值，套到新 CLI 上没意义甚至直接 spawn 报错，必须强制清空；
+  // 未换 CLI 时 input.model 留 undefined，applyBotConfigEdits 保持原值不动。
   const cliChanged = !!resolveCliId(input.cliChoice) && resolveCliId(input.cliChoice) !== bot.cliId;
-  if (cliChanged && !cliModelChoices(effectiveCliIdForModel)) {
-    // 切到一个不支持 model 的 adapter（例如 aiden / mtr / antigravity）：
-    // 即使原本配了 model 也要主动清空，避免 bots.json 里残留陈旧字段——
-    // 否则用户后面再换回支持 model 的 adapter 一路回车时，旧 model
-    // 会被当作"当前值"保留下来误套到新 CLI 上。
-    console.log('\n⚠️  新 CLI 不支持 --model 参数，已清空原 model 字段。');
+  if (cliChanged && bot.model) {
+    console.log('\n⚠️  已切换 CLI，原 model 字段已清空（如需指定 model 请用 /config 卡片或编辑 bots.json）。');
     input.model = null;
-  } else {
-    const promptCurrent = cliChanged ? undefined : (typeof bot.model === 'string' ? bot.model : undefined);
-    const result = await promptModel(rl, effectiveCliIdForModel, promptCurrent);
-    // 切换 CLI 时哪怕用户留空也要清掉旧 model —— 旧值是上一个 CLI 的 model，
-    // 套到新 CLI 上没意义。result === undefined 在"未变 CLI"分支等价于"保留旧值"，
-    // 但在 cliChanged 分支等价于"用户没指定，回到新 CLI 默认"，必须 force null。
-    input.model = cliChanged && result === undefined ? null : result;
   }
 
   printInputHelp('会话后端 backendType', [
@@ -1239,10 +1183,37 @@ function deleteAllBotmuxProcesses(home: string = PM2_HOME): void {
             env: pm2Env(home),
             timeout: 10_000,
           });
-        } catch { /* */ }
+        } catch (e) {
+          // Don't swallow silently — a failed delete here used to leave the
+          // restart half-done with no trace. Surface it (the auto-restart
+          // driver captures stderr to ~/.botmux/logs/maintenance-restart.log).
+          console.error(`[restart] pm2 delete ${app.name} failed: ${e instanceof Error ? e.message : e}`);
+        }
       }
     }
-  } catch { /* pm2 not running or no apps */ }
+  } catch (e) {
+    console.error(`[restart] pm2 jlist failed (pm2 not running or no apps?): ${e instanceof Error ? e.message : e}`);
+  }
+}
+
+function killPm2GodDaemon(home: string = PM2_HOME): void {
+  try {
+    execSync(`${pm2Bin()} kill`, {
+      stdio: 'inherit',
+      env: pm2Env(home),
+      timeout: 15_000,
+    });
+    return;
+  } catch {
+    // Fall back to direct pid cleanup below.
+  }
+
+  for (const pid of listPm2GodDaemonPids(home)) {
+    try { process.kill(pid, 'SIGTERM'); } catch { /* already gone */ }
+  }
+  for (const pid of listPm2GodDaemonPids(home)) {
+    try { process.kill(pid, 0); process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+  }
 }
 
 /**
@@ -1298,6 +1269,7 @@ async function cmdRestart(): Promise<void> {
     process.exit(1);
   }
   ensureConfigDir();
+  const includePm2 = process.argv.includes('--include-pm2');
   // Drop a restart-intent breadcrumb so the fresh daemon knows this was an
   // intentional restart and DMs the owner a summary. `IfAbsent` preserves a
   // richer breadcrumb (update / auto-restart) already written by the
@@ -1314,6 +1286,9 @@ async function cmdRestart(): Promise<void> {
   cleanupLegacyPm2();
   // Delete all botmux processes (handles both old single-process and new multi-process)
   deleteAllBotmuxProcesses();
+  if (includePm2) {
+    killPm2GodDaemon();
+  }
   // Wipe abandoned dashboard-daemon descriptors left behind by killed daemons.
   cleanupStaleDaemonDescriptors();
   runPm2(['start', cfg]);
@@ -1397,8 +1372,10 @@ function cmdLogs(): void {
     target = `/^${PM2_NAME}/`;
   }
 
-  // Use spawn for streaming output
-  const child = spawn(pm2Bin(), ['logs', target, '--lines', lines], {
+  // Use spawn for streaming output. Windows cannot spawn a .js CLI script
+  // directly, so run the bundled pm2 script through the current node.exe.
+  const pm2 = buildPm2SpawnCommand(pm2Bin(), ['logs', target, '--lines', lines]);
+  const child = spawn(pm2.command, pm2.args, {
     stdio: 'inherit',
     env: pm2Env(),
   });
@@ -1423,50 +1400,18 @@ function cmdUpgrade(): void {
 }
 
 /**
- * Call one of the dashboard's loopback HMAC `/__cli/*` endpoints.
- * - `/__cli/rotate` mints a fresh token and returns its URL, invalidating the
- *   previously-issued link.
- * - `/__cli/current` returns the existing token's URL WITHOUT rotating (404 →
- *   no token has ever been minted → `no-active-token`).
- * Returns { ok: true, url } on success, or { ok: false, reason } so callers can
- * decide how to surface the failure (hard error vs soft hint).
+ * Call one of the dashboard's loopback HMAC `/__cli/*` endpoints. Thin wrapper
+ * over {@link callDashboard}, which handles 404 disambiguation and self-heals a
+ * stale `.dashboard-port` that points at the wrong service (e.g. daemon IPC).
+ * See `src/cli/dashboard-endpoint.ts` for the why.
  */
-async function callDashboardEndpoint(
-  path: '/__cli/rotate' | '/__cli/current',
-): Promise<
-  | { ok: true; url: string }
-  | { ok: false; reason: 'no-secret' | 'unreachable' | 'http-error' | 'no-active-token'; detail?: string }
-> {
-  const SECRET_PATH = join(CONFIG_DIR, '.dashboard-secret');
-  if (!existsSync(SECRET_PATH)) return { ok: false, reason: 'no-secret' };
-  const secret = readFileSync(SECRET_PATH, 'utf8').trim();
-  const ts = Math.floor(Date.now() / 1000).toString();
-  const nonce = randomBytes(8).toString('hex');
-  const sig = createHmac('sha256', secret).update(`${ts}:${nonce}`).digest('base64url');
-  const portFile = join(CONFIG_DIR, '.dashboard-port');
-  const port = (existsSync(portFile) ? readFileSync(portFile, 'utf8').trim() : '')
-    || process.env.BOTMUX_DASHBOARD_PORT
-    || '7891';
-
-  let res: Response;
-  try {
-    res = await fetch(`http://127.0.0.1:${port}${path}`, {
-      method: 'POST',
-      headers: {
-        'X-Botmux-Cli-Ts': ts,
-        'X-Botmux-Cli-Nonce': nonce,
-        'X-Botmux-Cli-Auth': sig,
-      },
-    });
-  } catch {
-    return { ok: false, reason: 'unreachable' };
-  }
-  if (res.status === 404) return { ok: false, reason: 'no-active-token' };
-  if (!res.ok) {
-    return { ok: false, reason: 'http-error', detail: `${res.status} ${await res.text()}` };
-  }
-  const body = await res.json() as { url: string };
-  return { ok: true, url: body.url };
+async function callDashboardEndpoint(path: DashboardEndpoint): Promise<DashboardResult> {
+  return callDashboard({
+    configDir: CONFIG_DIR,
+    defaultPort: 7891,
+    envPort: process.env.BOTMUX_DASHBOARD_PORT,
+    path,
+  });
 }
 
 /**
@@ -1487,8 +1432,10 @@ async function printDashboardHintWithRetry(): Promise<void> {
       return;
     }
     // Terminal states — file-backed secret/token won't appear mid-poll, unlike
-    // a not-yet-listening port. Don't spin on them.
-    if (last.reason === 'no-secret' || last.reason === 'no-active-token') break;
+    // a not-yet-listening port. `wrong-service` means the port file points at a
+    // non-dashboard server and discovery already failed to find it, so retrying
+    // won't help either. Don't spin on any of them.
+    if (last.reason === 'no-secret' || last.reason === 'no-active-token' || last.reason === 'wrong-service') break;
     await new Promise(r => setTimeout(r, stepMs));
   }
   // Soft fallback
@@ -1496,6 +1443,8 @@ async function printDashboardHintWithRetry(): Promise<void> {
     console.log('   面板: 运行 `botmux dashboard` 获取链接');
   } else if (last?.reason === 'no-secret') {
     console.log('   面板: dashboard 凭证未就绪，启动后可用 `botmux dashboard` 获取链接');
+  } else if (last?.reason === 'wrong-service') {
+    console.log('   面板: `botmux dashboard`（端口文件可能已失效，必要时 `botmux restart` 刷新）');
   } else {
     console.log('   面板: `botmux dashboard`（daemon 启动中，稍后可获取链接）');
   }
@@ -1512,16 +1461,25 @@ async function cmdDashboard(): Promise<void> {
     console.log(r.url);
     return;
   }
+  const portFile = join(CONFIG_DIR, '.dashboard-port');
+  const recordedPort = (existsSync(portFile) ? readFileSync(portFile, 'utf8').trim() : '')
+    || process.env.BOTMUX_DASHBOARD_PORT
+    || '7891';
   if (r.reason === 'no-secret') {
     console.error('Dashboard not initialised. Run `botmux restart` first.');
   } else if (r.reason === 'unreachable') {
-    const portFile = join(CONFIG_DIR, '.dashboard-port');
-    const port = (existsSync(portFile) ? readFileSync(portFile, 'utf8').trim() : '')
-      || process.env.BOTMUX_DASHBOARD_PORT
-      || '7891';
     console.error(
-      `dashboard process not reachable on 127.0.0.1:${port} — \`botmux restart\` will start it`,
+      `dashboard process not reachable on 127.0.0.1:${recordedPort} — \`botmux restart\` will start it`,
     );
+  } else if (r.reason === 'wrong-service') {
+    // 127.0.0.1:<port> answered, but it isn't the dashboard (typically the
+    // daemon IPC server holding a port the stale .dashboard-port points at),
+    // and rediscovery across the probe range found no dashboard either.
+    console.error(
+      `127.0.0.1:${recordedPort} 上的服务不是 dashboard（端口文件 ~/.botmux/.dashboard-port 已失效，可能指向了 daemon IPC）。` +
+      '运行 `botmux restart` 重启 dashboard 并刷新端口文件。',
+    );
+    if (r.detail) console.error(`  详情: ${r.detail}`);
   } else {
     // `no-active-token` can't occur on rotate (it always mints); fall through.
     console.error('Rotation failed:', r.detail ?? r.reason);
@@ -1530,6 +1488,19 @@ async function cmdDashboard(): Promise<void> {
 }
 
 // ─── Session helpers ──────────────────────────────────────────────────────────
+
+interface AdoptedFromData {
+  source?: 'tmux' | 'herdr' | 'zellij';
+  tmuxTarget?: string;
+  zellijSession?: string;
+  zellijPaneId?: string;
+  herdrSessionName?: string;
+  herdrTarget?: string;
+  herdrPaneId?: string;
+  originalCliPid?: number;
+  cwd?: string;
+  cliId?: string;
+}
 
 interface SessionData {
   sessionId: string;
@@ -1553,6 +1524,8 @@ interface SessionData {
   /** Chat-scope quote chain — see Session.quoteTargetId in types.ts. */
   quoteTargetId?: string;
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string };
+  /** 文档评论入口当前轮回评论落点（见 Session.currentDocCommentTarget in types.ts）。 */
+  currentDocCommentTarget?: { fileToken: string; fileType: string; commentId: string; replyToName?: string; replyToOpenId?: string; turnId: string };
   quoteTargetSenderOpenId?: string;
   quoteTargetSenderIsBot?: boolean;
   pendingResponseCardId?: string;
@@ -1564,7 +1537,7 @@ interface SessionData {
   // unconfirmed /adopt scratch as a crashed CLI session.
   cliId?: string;
   lastCliInput?: string;
-  adoptedFrom?: unknown;
+  adoptedFrom?: AdoptedFromData;
 }
 
 /**
@@ -1799,7 +1772,7 @@ function formatSessionRow(
   s: SessionData,
   multiBot: boolean,
   botLabels: Map<string, string>,
-  cols: { id: number; bot?: number; title: number; dir: number; pid: number; uptime: number; status: number },
+  cols: { id: number; bot?: number; title: number; dir: number; pid: number; uptime: number; status: number; target: number },
 ): { text: string; alive: boolean } {
   const id = padEndDisplay(s.sessionId.substring(0, 8), cols.id);
   const parts = [id];
@@ -1809,11 +1782,13 @@ function formatSessionRow(
   }
   const title = padEndDisplay(truncate((s.title || '(untitled)').replace(/[\r\n]+/g, ' '), cols.title), cols.title);
   const dir = padEndDisplay(truncate(s.workingDir || '-', cols.dir), cols.dir);
-  const pid = s.pid ? String(s.pid).padEnd(cols.pid) : '-'.padEnd(cols.pid);
+  const displayPid = sessionDisplayPid(s);
+  const pid = displayPid ? String(displayPid).padEnd(cols.pid) : '-'.padEnd(cols.pid);
   const uptime = formatDuration(Date.now() - new Date(s.createdAt).getTime()).padEnd(cols.uptime);
-  const alive = !!(s.pid && isProcessAlive(s.pid));
-  const status = (alive ? 'online' : s.pid ? 'stopped' : 'idle').padEnd(cols.status);
-  parts.push(title, dir, pid, uptime, status);
+  const alive = isSessionAliveForList(s);
+  const status = padEndDisplay(sessionStatusLabel(s), cols.status);
+  const target = padEndDisplay(truncate(sessionTargetLabel(s), cols.target), cols.target);
+  parts.push(title, dir, pid, uptime, status, target);
   return { text: parts.join(' │ '), alive };
 }
 
@@ -1827,7 +1802,7 @@ function printSessionTable(active: SessionData[]): void {
     botLabels.set(b.larkAppId, `bot${i + 1} (${b.cliId ?? 'claude-code'})`);
   }
 
-  const cols = { id: 10, ...(multiBot ? { bot: 22 } : {}), title: 28, dir: 28, pid: 8, uptime: 8, status: 8 };
+  const cols = { id: 10, ...(multiBot ? { bot: 22 } : {}), title: 28, dir: 28, pid: 8, uptime: 8, status: 8, target: 26 };
 
   const headerParts = ['id'.padEnd(cols.id)];
   if (multiBot) headerParts.push('bot'.padEnd(cols.bot!));
@@ -1837,6 +1812,7 @@ function printSessionTable(active: SessionData[]): void {
     'pid'.padEnd(cols.pid),
     'uptime'.padEnd(cols.uptime),
     'status'.padEnd(cols.status),
+    'target'.padEnd(cols.target),
   );
   const header = headerParts.join(' │ ');
   const separator = '─'.repeat(displayWidth(header));
@@ -1864,6 +1840,70 @@ function tmuxSessionExists(name: string): boolean {
   }
 }
 
+function applyTmuxWindowSizeLargest(sessionName: string): void {
+  try {
+    execFileSync('tmux', ['set-option', '-t', sessionName, 'window-size', 'largest'], {
+      stdio: 'ignore',
+      timeout: 3000,
+      env: tmuxEnv(),
+    });
+  } catch { /* best-effort: attach can still proceed */ }
+}
+
+function isAdoptedSession(s: SessionData): s is SessionData & { adoptedFrom: AdoptedFromData } {
+  return !!s.adoptedFrom && typeof s.adoptedFrom === 'object';
+}
+
+function adoptedCliPid(s: SessionData): number | undefined {
+  const pid = isAdoptedSession(s) ? s.adoptedFrom.originalCliPid : undefined;
+  return typeof pid === 'number' && pid > 0 ? pid : undefined;
+}
+
+function adoptTargetLabel(s: SessionData): string {
+  if (!isAdoptedSession(s)) return '';
+  const a = s.adoptedFrom;
+  if (a.source === 'zellij' || a.zellijPaneId) {
+    const target = a.zellijSession && a.zellijPaneId
+      ? `${a.zellijSession}/${a.zellijPaneId}`
+      : a.zellijPaneId || a.zellijSession || '?';
+    return `adopt: zellij ${target}`;
+  }
+  if (a.source === 'herdr' || a.herdrSessionName || a.herdrPaneId || a.herdrTarget) {
+    const pane = a.herdrTarget ?? a.herdrPaneId ?? '?';
+    const target = a.herdrSessionName ? `${a.herdrSessionName}:${pane}` : pane;
+    return `adopt: herdr ${target}`;
+  }
+  return `adopt: tmux ${a.tmuxTarget ?? '?'}`;
+}
+
+function sessionDisplayPid(s: SessionData): number | undefined {
+  return adoptedCliPid(s) ?? s.pid;
+}
+
+function isSessionAliveForList(s: SessionData): boolean {
+  const pid = sessionDisplayPid(s);
+  return !!(pid && isProcessAlive(pid));
+}
+
+function sessionStatusLabel(s: SessionData): string {
+  if (isAdoptedSession(s)) {
+    const pid = adoptedCliPid(s);
+    if (pid) return isProcessAlive(pid) ? 'adopt' : 'stopped';
+    return s.pid && isProcessAlive(s.pid) ? 'adopt' : 'idle';
+  }
+  return s.pid && isProcessAlive(s.pid) ? 'online' : s.pid ? 'stopped' : 'idle';
+}
+
+function sessionTargetLabel(s: SessionData, tmuxName?: string, hasTmux?: boolean): string {
+  if (isAdoptedSession(s)) return adoptTargetLabel(s);
+  if (hasTmux === undefined) {
+    const name = tmuxName ?? `bmx-${s.sessionId.substring(0, 8)}`;
+    hasTmux = tmuxSessionExists(name);
+    tmuxName = name;
+  }
+  return hasTmux ? `tmux: ${tmuxName}` : '-';
+}
+
 /** Shorten path for display: replace $HOME with ~. */
 function shortenPath(p: string): string {
   const home = homedir();
@@ -1884,10 +1924,10 @@ function interactiveSessionPicker(active: SessionData[]): Promise<void> {
   const termWidth = process.stdout.columns || 100;
   const PREFIX = 4;    // "  ❯ " or "    "
   const SEP_W = 3;     // " │ "
-  const fixedCols = { id: 10, pid: 8, uptime: 7, status: 7 };
+  const fixedCols = { id: 10, pid: 8, uptime: 7, status: 7, target: 26 };
   const botW = multiBot ? 18 : 0;
-  const numSeps = (multiBot ? 7 : 6) - 1;  // separators between columns
-  const fixedTotal = PREFIX + fixedCols.id + botW + fixedCols.pid + fixedCols.uptime + fixedCols.status + numSeps * SEP_W;
+  const numSeps = (multiBot ? 8 : 7) - 1;  // separators between columns
+  const fixedTotal = PREFIX + fixedCols.id + botW + fixedCols.pid + fixedCols.uptime + fixedCols.status + fixedCols.target + numSeps * SEP_W;
   const flexTotal = Math.max(20, termWidth - fixedTotal);
   const titleW = Math.floor(flexTotal * 0.4);
   const dirW = flexTotal - titleW;
@@ -1900,11 +1940,25 @@ function interactiveSessionPicker(active: SessionData[]): Promise<void> {
     pid: fixedCols.pid,
     uptime: fixedCols.uptime,
     status: fixedCols.status,
+    target: fixedCols.target,
   };
 
   // Build row data — use shortened paths for TUI
-  function buildRows(): Array<{ session: SessionData; text: string; alive: boolean; tmuxName: string; hasTmux: boolean }> {
+  function buildRows(): Array<{
+    session: SessionData;
+    text: string;
+    alive: boolean;
+    tmuxName: string;
+    hasTmux: boolean;
+    isAdopt: boolean;
+    targetLabel: string;
+    canAttach: boolean;
+  }> {
     return active.map(s => {
+      const tmuxName = `bmx-${s.sessionId.substring(0, 8)}`;
+      const isAdopt = isAdoptedSession(s);
+      const hasTmux = !isAdopt && tmuxSessionExists(tmuxName);
+      const targetLabel = sessionTargetLabel(s, tmuxName, hasTmux);
       // Build row text with shortened dir
       const id = padEndDisplay(s.sessionId.substring(0, 8), cols.id);
       const parts = [id];
@@ -1914,15 +1968,15 @@ function interactiveSessionPicker(active: SessionData[]): Promise<void> {
       }
       const title = padEndDisplay(truncate((s.title || '(untitled)').replace(/[\r\n]+/g, ' '), cols.title), cols.title);
       const dir = padEndDisplay(truncate(shortenPath(s.workingDir || '-'), cols.dir), cols.dir);
-      const pid = s.pid ? String(s.pid).padEnd(cols.pid) : '-'.padEnd(cols.pid);
+      const displayPid = sessionDisplayPid(s);
+      const pid = displayPid ? String(displayPid).padEnd(cols.pid) : '-'.padEnd(cols.pid);
       const uptime = formatDuration(Date.now() - new Date(s.createdAt).getTime()).padEnd(cols.uptime);
-      const alive = !!(s.pid && isProcessAlive(s.pid));
-      const status = (alive ? 'online' : s.pid ? 'stopped' : 'idle').padEnd(cols.status);
-      parts.push(title, dir, pid, uptime, status);
+      const alive = isSessionAliveForList(s);
+      const status = padEndDisplay(sessionStatusLabel(s), cols.status);
+      const target = padEndDisplay(truncate(targetLabel, cols.target), cols.target);
+      parts.push(title, dir, pid, uptime, status, target);
 
-      const tmuxName = `bmx-${s.sessionId.substring(0, 8)}`;
-      const hasTmux = tmuxSessionExists(tmuxName);
-      return { session: s, text: parts.join(' │ '), alive, tmuxName, hasTmux };
+      return { session: s, text: parts.join(' │ '), alive, tmuxName, hasTmux, isAdopt, targetLabel, canAttach: hasTmux && !isAdopt };
     });
   }
 
@@ -1938,6 +1992,7 @@ function interactiveSessionPicker(active: SessionData[]): Promise<void> {
       'pid'.padEnd(cols.pid),
       'uptime'.padEnd(cols.uptime),
       'status'.padEnd(cols.status),
+      'target'.padEnd(cols.target),
     );
     return hParts.join(' │ ');
   }
@@ -1980,10 +2035,12 @@ function interactiveSessionPicker(active: SessionData[]): Promise<void> {
 
     // Footer info
     const selected = rows[cursor];
-    const tmuxHint = selected.hasTmux
-      ? `\x1b[32mtmux: ${selected.tmuxName}\x1b[0m`
-      : `\x1b[2mtmux: 无会话\x1b[0m`;
-    process.stdout.write(`\n  ${tmuxHint}\n`);
+    const targetHint = selected.isAdopt
+      ? `\x1b[33m${selected.targetLabel}\x1b[0m  \x1b[2mEnter 已禁用；请直接使用原 tmux/zellij/herdr 客户端。\x1b[0m`
+      : selected.hasTmux
+        ? `\x1b[32mtmux: ${selected.tmuxName}\x1b[0m`
+        : `\x1b[2mtmux: 无会话\x1b[0m`;
+    process.stdout.write(`\n  ${targetHint}\n`);
 
     // Flash message or confirmation prompt
     if (confirmDelete) {
@@ -1996,7 +2053,7 @@ function interactiveSessionPicker(active: SessionData[]): Promise<void> {
     }
 
     // Keybinding hints
-    process.stdout.write(`\n  \x1b[2m↑/↓ 选择  ⏎ 连接  d 删除  q 退出\x1b[0m\n`);
+    process.stdout.write(`\n  \x1b[2m↑/↓ 选择  ⏎ ${selected?.canAttach ? '连接' : '不可连接'}  d 删除  q 退出\x1b[0m\n`);
   }
 
   return new Promise<void>((resolve) => {
@@ -2020,13 +2077,15 @@ function interactiveSessionPicker(active: SessionData[]): Promise<void> {
       const r = rows[idx];
       const s = r.session;
 
-      // Kill CLI process
-      if (s.pid && isProcessAlive(s.pid)) {
+      // Kill botmux's worker process. For adopted sessions, never kill the
+      // user's original CLI pid if an old record stored it in `pid`.
+      const originalPid = adoptedCliPid(s);
+      if (s.pid && s.pid !== originalPid && isProcessAlive(s.pid)) {
         killProcess(s.pid);
       }
 
-      // Kill tmux session
-      if (r.hasTmux) {
+      // Kill only botmux-owned tmux sessions. Adopted panes belong to the user.
+      if (!r.isAdopt && r.hasTmux) {
         try { execSync(`tmux kill-session -t '${r.tmuxName}' 2>/dev/null`, { stdio: 'ignore', env: tmuxEnv() }); } catch { /* */ }
       }
 
@@ -2096,11 +2155,17 @@ function interactiveSessionPicker(active: SessionData[]): Promise<void> {
       // Enter — attach to tmux
       if (key === '\r' || key === '\n') {
         const selected = rows[cursor];
-        if (!selected.hasTmux) {
+        if (selected.isAdopt) {
+          flashMsg = `\x1b[33m这是 adopt 会话；botmux 不 attach 用户 pane。目标: ${selected.targetLabel}\x1b[0m`;
+          render();
+          return;
+        }
+        if (!selected.canAttach) {
           flashMsg = '\x1b[33m该会话没有 tmux，无法连接\x1b[0m';
           render();
           return;
         }
+        applyTmuxWindowSizeLargest(selected.tmuxName);
         cleanup();
         spawnSync('tmux', ['attach-session', '-t', selected.tmuxName], {
           stdio: 'inherit',
@@ -2129,6 +2194,19 @@ async function cmdList(): Promise<void> {
   const prunedScratch: SessionData[] = [];
   const live: SessionData[] = [];
   for (const s of active) {
+    if (isAdoptedSession(s)) {
+      const pid = adoptedCliPid(s);
+      if (pid && isProcessAlive(pid)) {
+        live.push(s);
+      } else if (pid) {
+        pruned.push(s);
+      } else {
+        const hasPid = !!(s.pid && isProcessAlive(s.pid));
+        hasPid ? live.push(s) : pruned.push(s);
+      }
+      continue;
+    }
+
     const hasPid = !!(s.pid && isProcessAlive(s.pid));
     const hasTmux = tmuxSessionExists(`bmx-${s.sessionId.substring(0, 8)}`);
     if (!hasPid && !hasTmux) {
@@ -2149,7 +2227,7 @@ async function cmdList(): Promise<void> {
   closeNow(prunedScratch);
   if (pruned.length > 0) {
     closeNow(pruned);
-    console.log(`已自动清理 ${pruned.length} 个不可恢复的会话（进程已死且无 tmux session）`);
+    console.log(`已自动清理 ${pruned.length} 个不可恢复的会话（进程已退出或无可恢复后端）`);
   }
 
   // Sort by creation time, newest first
@@ -2191,6 +2269,10 @@ function cmdDelete(): void {
     toDelete = active;
   } else if (target === 'stopped') {
     toDelete = active.filter(s => {
+      if (isAdoptedSession(s)) {
+        const pid = adoptedCliPid(s);
+        return pid ? !isProcessAlive(pid) : !(s.pid && isProcessAlive(s.pid));
+      }
       const hasPid = !!(s.pid && isProcessAlive(s.pid));
       const hasTmux = tmuxSessionExists(`bmx-${s.sessionId.substring(0, 8)}`);
       return !hasPid && !hasTmux;
@@ -2217,18 +2299,24 @@ function cmdDelete(): void {
   }
 
   for (const s of toDelete) {
-    // Kill CLI process if running
-    if (s.pid && isProcessAlive(s.pid)) {
+    const originalPid = adoptedCliPid(s);
+
+    // Kill botmux's worker process if running. For adopted sessions, never
+    // kill the user's original CLI pid.
+    if (s.pid && s.pid !== originalPid && isProcessAlive(s.pid)) {
       killProcess(s.pid);
       console.log(`  killed pid ${s.pid}`);
     }
 
-    // Kill associated tmux session if it exists
+    // Kill associated botmux-owned tmux session if it exists. Adopted panes
+    // belong to the user and must be left untouched.
     const tmuxName = `bmx-${s.sessionId.substring(0, 8)}`;
-    try {
-      execSync(`tmux kill-session -t '${tmuxName}' 2>/dev/null`, { stdio: 'ignore', env: tmuxEnv() });
-      console.log(`  killed tmux ${tmuxName}`);
-    } catch { /* no tmux session */ }
+    if (!isAdoptedSession(s)) {
+      try {
+        execSync(`tmux kill-session -t '${tmuxName}' 2>/dev/null`, { stdio: 'ignore', env: tmuxEnv() });
+        console.log(`  killed tmux ${tmuxName}`);
+      } catch { /* no tmux session */ }
+    }
 
     // Mark session as closed
     s.status = 'closed';
@@ -2485,7 +2573,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
               默认使用 botmux 内置 Feishu Web QR 登录尝试自动导入权限/redirect/发布版本；可加 --no-open-platform-auto 跳过
   start       启动 daemon
   stop        停止 daemon
-  restart     重启 daemon（自动恢复活跃会话）
+  restart     重启 daemon（自动恢复活跃会话；--include-pm2 同时重启 PM2 God）
   logs        查看 daemon 日志（--lines N, --bot <0-based-index|pm2-name|appId>）
   status      查看 daemon 状态
   upgrade     升级到最新版本
@@ -2568,15 +2656,14 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
 // ─── Schedule subcommands ────────────────────────────────────────────────────
 
 /**
- * Walk the process tree looking for a CLI-pid marker written by the botmux
- * worker. Returns the sessionId stored in the marker (or '' if empty/legacy).
- *
- * This mirrors server.ts:findAncestorCliMarker but is local to cli.ts so
- * subcommands invoked from inside an agent session can auto-detect which
- * session they belong to.
+ * Resolve which botmux session this subcommand belongs to. Prefers the
+ * process-tree CLI-pid marker (carries the fresh turnId); falls back to the
+ * inherited BOTMUX_SESSION_ID env when the ancestry is broken (detached/
+ * backgrounded/deeply-nested invocations). See resolveSessionContext for why
+ * the env fallback is safe.
  */
 function findAncestorSessionContext(): { sessionId: string; turnId?: string } | null {
-  return findAncestorSessionContextFromMarkers(resolveDataDir());
+  return resolveSessionContext(resolveDataDir(), process.env.BOTMUX_SESSION_ID);
 }
 
 function findAncestorSessionId(): string | null {
@@ -3168,6 +3255,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       content = await readStdin();
     }
   }
+  if (!contentFile) rejectLikelyWindowsStdinMojibake(content);
 
   if (!content.trim() && images.length === 0 && files.length === 0) {
     console.error('没有内容可发送。用法:\n  echo "消息" | botmux send\n  botmux send "消息"\n  botmux send --content-file /tmp/msg.md --images /tmp/chart.png');
@@ -3229,6 +3317,61 @@ async function cmdSend(rest: string[]): Promise<void> {
       process.exit(1);
     }
     if (dir) { try { rmSync(dir, { recursive: true, force: true }); } catch { /* */ } }
+    return;
+  }
+
+  // ── 文档评论入口分流（/subscribe-lark-doc）──────────────────────────────────
+  // 本轮若由飞书文档评论触发（daemon 已把落点写进 session.currentDocCommentTarget），
+  // 把用户可见回复发表为飞书文档评论，而非发回飞书会话。绕过 @ 硬门（评论不 @ 飞书
+  // 用户）。显式改路由（--top-level / --chat-id / --into）时不分流，让模型仍能主动
+  // 「磁盘上有 currentDocCommentTarget」即权威信号=本轮是文档评论轮（beginNewTurn
+  // 在飞书轮已清盘）。故只看 docTarget 存在 + 无显式改路由，不再卡 turnId 相等
+  // （之前 currentTurnId 取自 cliPidMarker，文档轮里取值不稳导致误判落到 @ 硬门）。
+  const docTarget = s.currentDocCommentTarget;
+  if (docTarget && !sendTopLevel && !overrideChatId && !sendInto) {
+    const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
+    try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
+    const { replyToDocComment, chunkCommentText } = await import('./im/lark/doc-comment.js');
+    const appId = s.larkAppId!;
+    const loc = localeForBot(appId);
+    try {
+      // @ 落点：--mention-back → 回 @ 原评论人；--mention <open_id[:name]> → @ 指定人；
+      // 否则（--no-mention / 无）不 @。文档评论里靠 person 元素渲染 @，仅首块加。
+      let docMentionOpenId: string | undefined;
+      if (mentionBack) docMentionOpenId = docTarget.replyToOpenId;
+      else if (mentionArgs.length > 0) {
+        const first = mentionArgs[0];
+        const idx = first.indexOf(':');
+        docMentionOpenId = (idx > 0 ? first.slice(0, idx) : first).trim() || undefined;
+      }
+      // 嵌套回复到用户那条评论 thread（已挂其下，无需 ↪ 前缀）。
+      const chunks = chunkCommentText(content);
+      for (let i = 0; i < chunks.length; i++) {
+        await replyToDocComment(appId, { fileToken: docTarget.fileToken, fileType: docTarget.fileType }, docTarget.commentId, chunks[i], i === 0 ? docMentionOpenId : undefined);
+      }
+      // 写 bridge send marker → 抑制 worker 的 final_output 兜底（否则会再补一条评论）。
+      try {
+        const markerDir = join(resolveDataDir(), 'turn-sends');
+        if (!existsSync(markerDir)) mkdirSync(markerDir, { recursive: true });
+        appendFileSync(join(markerDir, `${sid}.jsonl`), JSON.stringify({ sentAtMs: Date.now(), messageId: `doc:${docTarget.commentId}`, contentLength: content.length }) + '\n');
+      } catch { /* best-effort：漏记只多一条兜底 */ }
+      // 收尾飞书侧占位卡（streaming-disabled 会话）避免停在「处理中」。
+      try {
+        const pendingCardId = claimPendingResponseCard(s);
+        const latest = pendingCardId ? loadSessionFresh(s) : undefined;
+        if (pendingCardId && latest?.pendingResponseCardId === pendingCardId) {
+          const { updateMessage } = await import('./im/lark/client.js');
+          const { buildMarkdownCard } = await import('./im/lark/md-card.js');
+          await updateMessage(appId, pendingCardId, buildMarkdownCard(t('daemon.doc_comment_replied_card', undefined, loc), undefined, resolveBrandLabel(appId), loc));
+          if (markPendingResponseCardPatchedIfCurrent(latest, pendingCardId)) saveSession(latest);
+        }
+      } catch { /* best-effort */ }
+      console.error(`✓ 已回复文档评论 ${docTarget.commentId.slice(0, 12)}（${chunks.length} 条）`);
+      console.log(JSON.stringify({ success: true, commentId: docTarget.commentId, sessionId: sid, kind: 'doc-comment', chunks: chunks.length }));
+    } catch (e: any) {
+      console.error(`文档评论发送失败：${e?.message ?? e}`);
+      process.exit(1);
+    }
     return;
   }
 
@@ -4003,6 +4146,7 @@ async function cmdReport(rest: string[]): Promise<void> {
     const pos = positionals(rest);
     content = pos.length ? pos.join(' ') : await readStdin();
   }
+  if (!contentFile) rejectLikelyWindowsStdinMojibake(content);
   if (!content.trim()) {
     console.error('没有回报内容。用法: botmux report "子项目X 完成 + 产出位置"');
     process.exit(1);

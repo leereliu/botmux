@@ -11,6 +11,15 @@ import { type Brand, sdkDomain, normalizeBrand } from './im/lark/lark-hosts.js';
 
 export type ChatReplyMode = 'chat' | 'new-topic' | 'shared';
 
+function normalizeChatReplyModeConfig(raw: unknown): ChatReplyMode | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const v = raw.trim().toLowerCase();
+  if (v === 'chat') return 'chat';
+  if (v === 'new-topic' || v === 'newtopic' || v === 'thread') return 'new-topic';
+  if (v === 'topic' || v === 'shared' || v === 'share' || v === 'alias' || v === 'topic-alias' || v === 'topic_alias') return 'shared';
+  return undefined;
+}
+
 export interface OncallChat {
   /** Lark chat_id (oc_xxx) the bot was pulled into. */
   chatId: string;
@@ -51,6 +60,16 @@ export interface BotConfig {
   name?: string;
   cliId: CliId;
   cliPathOverride?: string;
+  /**
+   * 通用启动前缀（按空格拆 token）：worker spawn 时把启动命令拼成
+   * `<wrapperCli> <CLI 参数>`（首 token 当 bin 走 PATH 解析），无需 wrapper 脚本、跨系统。
+   * 典型值 `"aiden x claude"` / `"aiden x codex"`（内网网关 aiden-aiproxy + SSO），也能
+   * 承载 ccr / claude-w 等任意启动器。`cliId` 仍是底层适配器（claude→claude-code、
+   * codex→codex），所有适配器机制（hook / bridge / resume）照常工作；设了 wrapperCli 后
+   * 它的首 token 取代 cliId 的默认 bin（cliPathOverride 不再生效）。检测到前缀是
+   * `aiden x claude` 时自动剥掉 aiden 拒收的 --settings。见 src/setup/cli-selection.ts。
+   */
+  wrapperCli?: string;
   /**
    * Optional model name passed to the CLI at spawn time (e.g. `claude --model
    * opus`). Each adapter decides how to inject it — adapters whose CLI has no
@@ -246,6 +265,13 @@ export interface BotConfig {
    */
   regularGroupMentionMode?: 'always' | 'topic' | 'never';
   /**
+   * 飞书文档订阅入口（/subscribe-lark-doc）新订阅的默认评论触发范围：
+   *   • 'mention-only'（或 undefined）— 仅评论里 @bot 才触发（默认，防噪声）
+   *   • 'all'                        — 该文档所有新评论都触发
+   * 单条订阅的触发范围之后可在 dashboard 逐文档改（doc-subscriptions 表）。
+   */
+  docSubscribeDefaultMode?: 'mention-only' | 'all';
+  /**
    * Per-bot voice-engine override for the voice-summary feature. Merged OVER
    * the global `voice` block in ~/.botmux/config.json (per-bot wins field by
    * field). When this bot has usable voice creds (here or globally), its reply
@@ -286,13 +312,64 @@ export function getLoadedConfigPath(): string | undefined {
 // traces, etc.); without DEBUG=1 those become no-ops in the CLI path and
 // stay in daemon.log on the daemon path — pm2's error.log no longer sees
 // "[lark:info] client ready" floods.
+// Cap raw dumps so an unrecognized error shape can never flood the log the way
+// the SDK's full AxiosError blob (stack + config + headers) did — that bloated
+// pm2's error.log past 1GB and, worse, leaked the `Authorization: Bearer t-…`
+// access token on every request failure.
+const MAX_FALLBACK_LEN = 300;
 function safeStringify(v: unknown): string {
   if (typeof v === 'string') return v;
-  try { return JSON.stringify(v); } catch { return String(v); }
+  let s: string;
+  try { s = JSON.stringify(v) ?? String(v); } catch { s = String(v); }
+  return s.length > MAX_FALLBACK_LEN ? `${s.slice(0, MAX_FALLBACK_LEN)}…(+${s.length - MAX_FALLBACK_LEN})` : s;
 }
-const fmtLark = (msg: any[]) => msg.map(safeStringify).join(' ');
+
+// Drop the protocol+host (and `/open-apis/` prefix) so the line shows just the
+// API path that matters for triage, never the bearer token in the URL/headers.
+function shortLarkPath(url: unknown): string {
+  if (typeof url !== 'string' || !url) return '';
+  const path = url.replace(/^https?:\/\/[^/]+/, '').replace(/^\/open-apis\//, '');
+  return path || url;
+}
+
+/**
+ * Condense a Lark SDK error into one readable line, preserving just the fields
+ * needed to triage (HTTP status + business `code`/`msg`/`log_id`). Returns null
+ * when the value isn't an axios-shaped error, so callers fall back to
+ * length-capped stringify. Never serializes `config`/`headers`/`stack`, so the
+ * access token can't leak.
+ */
+export function formatLarkError(v: any): string | null {
+  if (!v || typeof v !== 'object') return null;
+  const isAxios = v.isAxiosError === true || v.name === 'AxiosError' || (v.config && (v.response || v.status != null));
+  if (!isAxios) return null;
+  const method = String(v.config?.method ?? '').toUpperCase();
+  const path = shortLarkPath(v.config?.url);
+  const httpStatus = v.response?.status ?? v.status;
+  // Lark business error lives in the response body; some shapes surface it on
+  // the error object directly.
+  const data = v.response?.data ?? {};
+  const code = data.code ?? v.code;
+  const msg = data.msg ?? v.msg;
+  const logId = data.log_id ?? data.logId;
+  const parts: string[] = [];
+  if (method) parts.push(method);
+  if (path) parts.push(path);
+  if (httpStatus != null || method || path) parts.push(`→ ${httpStatus ?? '?'}`);
+  if (typeof code === 'number') parts.push(`code=${code}`);
+  if (typeof msg === 'string' && msg) parts.push(`"${msg}"`);
+  if (logId) parts.push(`log_id=${logId}`);
+  if (!parts.length) return null;
+  return parts.join(' ');
+}
+
+const fmtLark = (msg: any[]) => msg.map((m) => formatLarkError(m) ?? safeStringify(m)).join(' ');
 const larkLogger = {
-  error: (...msg: any[]) => logger.error(`[lark] ${fmtLark(msg)}`),
+  // SDK request failures arrive here as raw AxiosError objects — condense to a
+  // single triage line (status + lark code/msg/log_id) instead of dumping the
+  // stack/config blob. Demoted to warn: nearly all are environmental and already
+  // handled at the call site (rate limits, bot-not-in-chat, stale threads).
+  error: (...msg: any[]) => logger.warn(`[lark] ${fmtLark(msg)}`),
   warn:  (...msg: any[]) => logger.warn(`[lark] ${fmtLark(msg)}`),
   info:  (...msg: any[]) => logger.info(`[lark] ${fmtLark(msg)}`),
   debug: (...msg: any[]) => logger.debug(`[lark] ${fmtLark(msg)}`),
@@ -568,7 +645,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       const out: { [chatId: string]: ChatReplyMode } = {};
       for (const [cid, mode] of Object.entries(entry.chatReplyModes)) {
         if (typeof cid !== 'string' || !cid.trim()) continue;
-        if (mode === 'chat' || mode === 'new-topic' || mode === 'shared') out[cid] = mode;
+        const normalizedMode = normalizeChatReplyModeConfig(mode);
+        if (normalizedMode) out[cid] = normalizedMode;
       }
       if (Object.keys(out).length > 0) chatReplyModes = out;
     }
@@ -662,6 +740,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       name: typeof entry.name === 'string' && entry.name.trim() ? entry.name.trim() : undefined,
       cliId: entry.cliId ?? 'claude-code',
       cliPathOverride: entry.cliPathOverride,
+      wrapperCli: typeof entry.wrapperCli === 'string' && entry.wrapperCli.trim()
+        ? entry.wrapperCli.trim()
+        : undefined,
       model: typeof entry.model === 'string' && entry.model.trim()
         ? entry.model.trim()
         : undefined,
@@ -711,14 +792,18 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // Per-bot regular-group default mode. Only 'new-topic' | 'shared' are
       // meaningful; 'chat' (the flat default) and anything else normalize to
       // undefined so bots.json stays clean.
-      regularGroupReplyMode: entry.regularGroupReplyMode === 'new-topic' || entry.regularGroupReplyMode === 'shared'
-        ? entry.regularGroupReplyMode
-        : undefined,
+      regularGroupReplyMode: (() => {
+        const mode = normalizeChatReplyModeConfig(entry.regularGroupReplyMode);
+        return mode === 'new-topic' || mode === 'shared' ? mode : undefined;
+      })(),
       // 3-tier @ policy. Only 'topic' | 'never' are meaningful; 'always' (the
       // default) and anything else normalize to undefined so bots.json stays clean.
       regularGroupMentionMode: entry.regularGroupMentionMode === 'topic' || entry.regularGroupMentionMode === 'never'
         ? entry.regularGroupMentionMode
         : undefined,
+      // 文档订阅默认触发范围。只 'all' 有意义；'mention-only'（默认）归一化为
+      // undefined 让 bots.json 保持干净。
+      docSubscribeDefaultMode: entry.docSubscribeDefaultMode === 'all' ? 'all' : undefined,
       voice,
     });
   }

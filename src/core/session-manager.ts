@@ -14,7 +14,7 @@ import { logger } from '../utils/logger.js';
 import { forkWorker, forkAdoptWorker, killStalePids, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, isRelayableRealSession, closeSession } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { buildBotmuxShellHints } from '../adapters/cli/shared-hints.js';
-import { getSessionPersistentBackendType, persistentSessionName, probePersistentSession, killPersistentSession } from './persistent-backend.js';
+import { getSessionPersistentBackendType, persistentSessionName, probePersistentSession, probePersistentBackendServer, killPersistentSession, type PersistentBackendType } from './persistent-backend.js';
 import { adoptTargetLabel, validateAdoptTargetState } from './session-discovery.js';
 import { getBot, getAllBots } from '../bot-registry.js';
 import type { CliId } from '../adapters/cli/types.js';
@@ -235,6 +235,16 @@ export function formatAttachmentsHint(attachments?: LarkAttachment[], locale?: L
   return `<attachments hint="${xmlEscape(t('ai.attach.hint', undefined, locale))}">\n${items.join('\n')}\n</attachments>`;
 }
 
+function renderRoleContextBlock(larkAppId: string | undefined, chatId: string | undefined): string {
+  if (!larkAppId || !chatId) return '';
+
+  const { content: roleContent, source: roleSource } = resolveRole(larkAppId, chatId);
+  if (!roleContent) return '';
+
+  const ctx = roleSource === 'team' ? 'team' : 'group';
+  return `<role context="${ctx}" chat_id="${xmlEscape(chatId)}">\n${roleContent}\n</role>`;
+}
+
 export function buildNewTopicPrompt(
   userMessage: string,
   sessionId: string,
@@ -272,14 +282,7 @@ export function buildNewTopicPrompt(
     ].join('\n');
   }
 
-  let roleBlock = '';
-  if (opts?.larkAppId && opts?.chatId) {
-    const { content: roleContent, source: roleSource } = resolveRole(opts.larkAppId, opts.chatId);
-    if (roleContent) {
-      const ctx = roleSource === 'team' ? 'team' : 'group';
-      roleBlock = `<role context="${ctx}" chat_id="${xmlEscape(opts.chatId)}">\n${roleContent}\n</role>`;
-    }
-  }
+  const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId);
 
   let mentionBlock = '';
   if (mentions && mentions.length > 0) {
@@ -312,7 +315,19 @@ export function buildNewTopicPrompt(
     ? [userMessage, ...followUps].join('\n\n')
     : userMessage;
   const userBlock = `<user_message>\n${mergedMessage}\n</user_message>`;
-  const parts: string[] = [userBlock];
+  const parts: string[] = [];
+
+  // Put stable, instruction-like context before the user's first turn. This
+  // improves salience without moving per-turn attribution (sender/mentions)
+  // into the prompt-cache prefix.
+  if (!adapter.injectsSessionContext) {
+    if (routingBlock) parts.push(routingBlock);
+    if (identityBlock) parts.push(identityBlock);
+    parts.push(`<session_id>${xmlEscape(sessionId)}</session_id>`);
+  }
+  if (roleBlock) parts.push(roleBlock);
+
+  parts.push(userBlock);
 
   const senderBlock = renderSenderTag(sender);
   if (senderBlock) parts.push(senderBlock);
@@ -325,12 +340,6 @@ export function buildNewTopicPrompt(
 
   // CLIs with injectsSessionContext (Claude Code) get Lark routing/identity
   // and session ID via system prompt, so skip those blocks here.
-  if (!adapter.injectsSessionContext) {
-    parts.push(`<session_id>${xmlEscape(sessionId)}</session_id>`);
-    if (routingBlock) parts.push(routingBlock);
-    if (identityBlock) parts.push(identityBlock);
-  }
-  if (roleBlock) parts.push(roleBlock);
   if (mentionBlock) parts.push(mentionBlock);
   if (botBlock) parts.push(botBlock);
 
@@ -347,7 +356,22 @@ export function buildFollowUpContent(
   sessionId: string,
   opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender; larkAppId?: string; chatId?: string },
 ): string {
-  const parts: string[] = [`<user_message>\n${content}\n</user_message>`];
+  const parts: string[] = [];
+  const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId);
+  const skipSessionId = opts?.isAdoptMode || (opts?.cliId
+    ? createCliAdapterSync(opts.cliId, opts.cliPathOverride).injectsSessionContext
+    : false);
+
+  // Put stable context before the user's turn. Follow the new-topic order for
+  // shared blocks: session id first, then role. Keep per-turn attribution and
+  // attachments after <user_message>.
+  if (!skipSessionId) parts.push(`<session_id>${xmlEscape(sessionId)}</session_id>`);
+  if (roleBlock) parts.push(roleBlock);
+  if (opts?.cliId !== 'mira') {
+    parts.push(`<botmux_reminder>${t('ai.followup.reminder', undefined, opts?.locale)}</botmux_reminder>`);
+  }
+
+  parts.push(`<user_message>\n${content}\n</user_message>`);
 
   const senderBlock = renderSenderTag(opts?.sender);
   if (senderBlock) parts.push(senderBlock);
@@ -360,34 +384,12 @@ export function buildFollowUpContent(
     : '';
   if (attachHint) parts.push(attachHint);
 
-  // Inject role for follow-up messages: per-chat override ＞ team default (same as buildNewTopicPrompt)
-  if (opts?.larkAppId && opts?.chatId) {
-    const { content: roleContent, source: roleSource } = resolveRole(opts.larkAppId, opts.chatId);
-    if (roleContent) {
-      const ctx = roleSource === 'team' ? 'team' : 'group';
-      parts.push(`<role context="${ctx}" chat_id="${xmlEscape(opts.chatId)}">\n${roleContent}\n</role>`);
-    }
-  }
-
-  if (!opts?.isAdoptMode) {
-    const skipSessionId = opts?.cliId
-      ? createCliAdapterSync(opts.cliId, opts.cliPathOverride).injectsSessionContext
-      : false;
-    if (!skipSessionId) {
-      parts.push(`<session_id>${xmlEscape(sessionId)}</session_id>`);
-    }
-  }
-
   if (opts?.mentions && opts.mentions.length > 0) {
     const items = opts.mentions.map(m => {
       const oid = m.openId ? ` open_id="${xmlEscape(m.openId)}"` : '';
       return `  <mention name="${xmlEscape(m.name)}"${oid} />`;
     });
     parts.push(`<mentions>\n${items.join('\n')}\n</mentions>`);
-  }
-
-  if (opts?.cliId !== 'mira') {
-    parts.push(`<botmux_reminder>${t('ai.followup.reminder', undefined, opts?.locale)}</botmux_reminder>`);
   }
 
   return parts.join('\n\n');
@@ -775,6 +777,16 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
   // actual re-fork is deferred into `toReattach` and staggered below so a box
   // with dozens of surviving sessions doesn't spike on restart.
   const toReattach: DaemonSession[] = [];
+  // Server-liveness is sampled ONCE per backend type (cached): a single
+  // `tmux list-sessions` answers for all of that backend's sessions, and a
+  // consistent snapshot avoids a mid-loop race where an early lazy fork could
+  // flip the answer partway through (the loop itself starts no workers).
+  const serverStateCache = new Map<PersistentBackendType, 'running' | 'down' | 'unknown'>();
+  const backendServerState = (bt: PersistentBackendType) => {
+    let s = serverStateCache.get(bt);
+    if (s === undefined) { s = probePersistentBackendServer(bt); serverStateCache.set(bt, s); }
+    return s;
+  };
   for (const [, ds] of activeSessions) {
     const backendType = getSessionPersistentBackendType(ds);
     if (!backendType) continue;
@@ -783,10 +795,21 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
     const backendName = persistentSessionName(backendType, ds.session.sessionId);
     const probe = probePersistentSession(backendType, backendName);
     if (probe === 'missing') {
-      // Probe succeeded and authoritatively says the backing pane/agent is gone
-      // — this is a true zombie. Close it (evicts the active record + marks the
-      // store row closed) so the next message starts a clean session.
       const tag = ds.session.sessionId.substring(0, 8);
+      // 'missing' is ambiguous: it means EITHER this one pane is gone while the
+      // server runs (a true solo zombie) OR the whole multiplexer server is down
+      // (e.g. machine reboot) and every pane vanished at once. Only the former is
+      // a zombie to close. On a reboot the CLI transcript on disk is still
+      // resumable, so keep the worker-less active record and let it lazily resume
+      // on the next message (exactly like a pty session) instead of mass-closing
+      // every session — the bug that wiped a full dashboard after a host reboot.
+      if (backendServerState(backendType) === 'down') {
+        logger.warn(`[${tag}] ${backendType} server is down (host reboot?) — keeping "${backendName}" active for lazy resume instead of closing`);
+        continue;
+      }
+      // Server is up (or its state is inconclusive) and this specific pane is
+      // gone — a true zombie. Close it (evicts the active record + marks the
+      // store row closed) so the next message starts a clean session.
       logger.warn(`[${tag}] ${backendType} backing session "${backendName}" is gone — closing zombie active session`);
       await closeSession(ds.session.sessionId);
       continue;

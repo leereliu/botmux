@@ -26,6 +26,7 @@ import {
   shouldRunQuietRotation,
   evaluatePidResolverPullback,
   decideFingerprintSwitch,
+  shouldHealAbsentBaseline,
   sessionIdFromJsonlPath,
   SESSION_ID_FILENAME_RE,
   type PidFollowResult,
@@ -56,9 +57,11 @@ import {
   resolveRenderDimensions,
 } from './utils/render-dimensions.js';
 import { createCliAdapterSync, locateOnPath } from './adapters/cli/registry.js';
+import { buildWrappedLaunch, parseWrapperCli, isTtadkWrapper } from './setup/cli-selection.js';
+import { findLaunchedCliPid, scheduleWrapperRealCliPid } from './core/session-discovery.js';
 import { claudeJsonlPathForSession, resolveJsonlFromPid, findOpenClaudeSessionIds, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
 import { mtrSessionIdForBotmuxSession } from './adapters/cli/mtr.js';
-import type { CliAdapter, PtyHandle, SubmitRecheckResult } from './adapters/cli/types.js';
+import type { CliAdapter, PtyHandle, SubmitRecheckResult, CliId } from './adapters/cli/types.js';
 import { PtyBackend } from './adapters/backend/pty-backend.js';
 import { HerdrBackend } from './adapters/backend/herdr-backend.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
@@ -149,7 +152,7 @@ function ensureZellijAttachConfig(): string {
 
 let sessionId = '';
 let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
-const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', seed: 'Seed', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', opencode: 'OpenCode', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes', mira: 'Mira', traex: 'TRAE', pi: 'Pi', copilot: 'Copilot', 'oh-my-pi': 'Oh My Pi' };
+const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', seed: 'Seed', relay: 'Relay', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', opencode: 'OpenCode', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes', mira: 'Mira', traex: 'TRAE', pi: 'Pi', copilot: 'Copilot', 'oh-my-pi': 'Oh My Pi' };
 function cliName(): string { return CLI_DISPLAY_NAMES[lastInitConfig?.cliId ?? ''] ?? 'CLI'; }
 let isPromptReady = false;
 /** Mutex for async flushPending — prevents concurrent flush loops. */
@@ -167,13 +170,52 @@ let readySignalTimer: ReturnType<typeof setTimeout> | null = null;
  *  back. The real signal lands within ~ms of the input box rendering, so this is
  *  pure insurance against a missing/failed hook — generous but bounded. */
 const READY_SIGNAL_TIMEOUT_MS = 45_000;
+/** Epoch ms of the most recent PTY output — used to settle for quiescence
+ *  before the first flush (see settleThenFlush). */
+let lastPtyOutputAtMs = 0;
+/** After the SessionStart signal fires, the input box has appeared but Ink's
+ *  startup render isn't fully drained yet — typing immediately trips Claude's
+ *  paste-burst heuristic and the `\` soft-newline markers (claude-code
+ *  writeInput) get kept literally. This is pronounced under wrapperCli launchers
+ *  (e.g. `aiden x claude`) whose Claude renders more at startup. So we wait for
+ *  the PTY to fall quiet for SETTLE_MS before the first flush — the signal still
+ *  gates readiness (anti-selector), the settle just lets the render drain. */
+const READY_FLUSH_SETTLE_MS = 1_000;
+/** Upper bound on the settle so a chatty startup (spinners, periodic redraw)
+ *  can't stall the first prompt indefinitely. */
+const READY_FLUSH_SETTLE_CAP_MS = 6_000;
+let readyFlushSettleTimer: ReturnType<typeof setTimeout> | null = null;
+/** True while the post-signal quiescence settle is in progress — flushPending
+ *  holds (just like the gate) so a message arriving mid-settle can't type-ahead
+ *  past the settle and re-trigger paste-burst. */
+let isSettlingFirstFlush = false;
+
+/** Wait until the PTY has been quiet for READY_FLUSH_SETTLE_MS (Ink render
+ *  drained), capped at READY_FLUSH_SETTLE_CAP_MS, then flush the held prompt. */
+function settleThenFlush(startedAtMs: number): void {
+  readyFlushSettleTimer = null;
+  const now = Date.now();
+  const quietForMs = now - lastPtyOutputAtMs;
+  if (quietForMs >= READY_FLUSH_SETTLE_MS || now - startedAtMs >= READY_FLUSH_SETTLE_CAP_MS) {
+    isSettlingFirstFlush = false;
+    log(`Ready-gate settle done (quiet ${quietForMs}ms); delivering held first prompt`);
+    void flushPending();
+    return;
+  }
+  const wait = Math.min(READY_FLUSH_SETTLE_MS - quietForMs, READY_FLUSH_SETTLE_CAP_MS - (now - startedAtMs));
+  readyFlushSettleTimer = setTimeout(() => settleThenFlush(startedAtMs), Math.max(50, wait));
+  readyFlushSettleTimer.unref?.();
+}
+
 /** Release the ready-gate and flush anything it held. No-op when the gate was
  *  never armed (other CLIs / adopt) or already released (idempotent). */
 function releaseReadyGate(reason: string): void {
   if (readySignalTimer) { clearTimeout(readySignalTimer); readySignalTimer = null; }
   if (readyGate.receive()) {
-    log(`Ready gate released (${reason}); delivering held first prompt`);
-    flushPending();
+    log(`Ready gate released (${reason}); settling for PTY quiescence before first flush`);
+    if (readyFlushSettleTimer) { clearTimeout(readyFlushSettleTimer); readyFlushSettleTimer = null; }
+    isSettlingFirstFlush = true;
+    settleThenFlush(Date.now());
   }
 }
 const pendingMessages: Array<{ content: string; turnId?: string }> = [];
@@ -1336,8 +1378,27 @@ function stopBridgeWatcher(): void {
 function bridgeMarkPendingTurn(messageText: string, preferredTurnId?: string): string | undefined {
   if (!bridgeJsonlPath) return undefined;
   if (!bridgeBaselineDone) {
-    log('Bridge baseline not ready — this turn will not have transcript-driven final_output');
-    return undefined;
+    // Self-heal a stuck baseline: the guessed transcript path never
+    // materialised (Claude wrote under a different sessionId, a stale resume
+    // id, or an /adopt sid persisted as the botmux sid). An absent file has
+    // no history to absorb, so arm fresh-empty readiness so THIS turn gets
+    // marked — the mark arms the per-tick exact-content fingerprint recovery,
+    // which finds the jsonl Claude actually wrote this message to and switches
+    // the bridge onto it (no dependence on Claude-internal pid files, so
+    // version-robust). See shouldHealAbsentBaseline for the full rationale.
+    if (shouldHealAbsentBaseline({
+      baselineDone: bridgeBaselineDone,
+      hasJsonlPath: !!bridgeJsonlPath,
+      jsonlFileExists: existsSyncSafe(bridgeJsonlPath),
+    })) {
+      bridgeOffset = 0;
+      bridgePendingTail = '';
+      bridgeBaselineDone = true;
+      log(`Bridge baseline self-healed: guessed transcript ${bridgeJsonlPath} absent; fresh-empty readiness armed for fingerprint recovery`);
+    } else {
+      log('Bridge baseline not ready — this turn will not have transcript-driven final_output');
+      return undefined;
+    }
   }
   const fingerprint = makeFingerprint(messageText);
   // Full normalised content powers the unknown-sid recovery path. When a
@@ -2692,7 +2753,9 @@ function onPtyData(data: string): void {
     }
   }
 
-  // Delegate idle detection to IdleDetector
+  // Track last PTY output time for the ready-gate quiescence settle (see
+  // settleThenFlush) and delegate idle detection to IdleDetector.
+  lastPtyOutputAtMs = Date.now();
   idleDetector?.feed(data);
 }
 
@@ -2878,6 +2941,12 @@ async function flushPending(): Promise<void> {
   // the signal (or fallback timeout) lands. No-op for non-armed gates / other CLIs.
   if (readyGate.shouldHold()) {
     log(`Holding ${pendingMessages.length} pending message(s) until SessionStart ready signal`);
+    return;
+  }
+  // Post-signal quiescence settle in progress — hold so the first write lands
+  // after Ink's startup render has drained (else paste-burst keeps `\` literal).
+  if (isSettlingFirstFlush) {
+    log(`Holding ${pendingMessages.length} pending message(s) until ready-gate settle completes`);
     return;
   }
   // Type-ahead adapters flush even while the CLI is busy; others wait for
@@ -3332,7 +3401,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     const rows = cfg.adoptPaneRows ?? PTY_ROWS;
     const observeBe: ObserveBackend = cfg.adoptZellijPaneId
       ? new ZellijObserveBackend(cfg.adoptZellijSession ?? '', cfg.adoptZellijPaneId, { cliPid: cfg.adoptCliPid })
-      : new TmuxPipeBackend(cfg.adoptTmuxTarget!);
+      : new TmuxPipeBackend(cfg.adoptTmuxTarget!, { cliPid: cfg.adoptCliPid });
     effectiveBackendType = cfg.adoptZellijPaneId ? 'zellij' : 'tmux';
     backend = observeBe;
     observeBe.spawn('', [], {
@@ -3497,6 +3566,9 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // the fresh session's first turn.
   lastSpawnEffectiveResume = effectiveResume;
 
+  // ttadk 网关：模型走 ttadk 自己的 `-m`（启动期注入到 ttadk 前缀，见下方 wrapperCli
+  // 分支），不能再把 cfg.model 透给底层适配器，否则真实 CLI 会再吃一个 --model 重复。
+  const ttadkGateway = isTtadkWrapper(cfg.wrapperCli);
   const args = cliAdapter.buildArgs({
     sessionId: effectiveAdapterSessionId,
     resume: effectiveResume,
@@ -3506,7 +3578,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     botName: cfg.botName,
     botOpenId: cfg.botOpenId,
     locale: cfg.locale,
-    model: cfg.model,
+    model: ttadkGateway ? undefined : cfg.model,
     disableCliBypass: cfg.disableCliBypass === true,
   });
 
@@ -3673,6 +3745,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
           cliArgs: args,
           hidePaths: cfg.sandboxHidePaths ?? [],
           authPaths: cliAdapter.authPaths,
+          extraExecPaths: cliAdapter.sandboxExtraExecPaths?.(),
         });
         if (sbx) {
           spawnBin = sbx.bin;
@@ -3701,6 +3774,54 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     }
   }
 
+  // 通用启动前缀（wrapperCli）：把启动命令重写成 `<wrapperCli> <CLI 参数>`（首 token 当
+  // bin 走 PATH 解析），无需 wrapper 脚本、跨系统。aiden x claude 形态会剥掉 aiden 拒收的
+  // --settings（见 buildWrappedLaunch）。与文件沙盒互斥：沙盒已把命令重写成 bwrap，叠加
+  // 前缀会破坏隔离，故 sandboxOn 时跳过并告警（网关 + oncall 沙盒本就不是合理组合）。
+  // CJADK_INTERACTIVE is a cjadk-only knob we set on the cjadk wrapper branch
+  // below. Strip any value inherited from the daemon's own env first so a
+  // daemon launched under `cjadk feishu` (which exports it) can't leak it via
+  // the tmux env allowlist into EVERY bot's pane — only the cjadk branch should
+  // ever (re)set it. Harmless for non-cjadk CLIs (they don't read it), but this
+  // keeps the behaviour intentional rather than ambient. (Codex review note.)
+  delete (childEnv as Record<string, string>).CJADK_INTERACTIVE;
+
+  if (cfg.wrapperCli && cfg.wrapperCli.trim()) {
+    if (sandboxOn) {
+      log(`wrapperCli="${cfg.wrapperCli}" ignored: file sandbox enabled and takes precedence (cannot combine launch prefix with bwrap)`);
+    } else {
+      const launch = buildWrappedLaunch(cfg.wrapperCli, spawnArgs, (b) => locateOnPath(b) ?? b, {
+        ttadkModel: cfg.model,
+      });
+      if (launch.bin) {
+        spawnBin = launch.bin;
+        spawnArgs = launch.args;
+        log(`Launch prefix: spawning ${spawnBin} ${spawnArgs.slice(0, 2).join(' ')} … (cliId=${cfg.cliId})`);
+        // ttadk runs its launched agent through a gateway that pops an interactive
+        // model-picker unless `-m <model>` is given. buildWrappedLaunch injects
+        // `-m <bot.model || glm-5.1> --skip-check` into the ttadk prefix above
+        // (CoCo excluded — it takes no -m). The model is sourced from the bot's
+        // `model` config (editable in the dashboard), NOT baked into wrapperCli.
+        if (ttadkGateway) {
+          log(`ttadk launcher: model=${(cfg.model ?? '').trim() || 'glm-5.1 (default)'} injected as -m, suppressed on underlying ${cfg.cliId}`);
+        }
+        // cjadk runs its launched agent in an INTERACTIVE wrapper by default —
+        // a model/session selector at startup plus terminal quirks that fight
+        // botmux's automated input (the selector eats the first prompt; the
+        // pre-render lag fragments multi-line messages; follow-ups can stick in
+        // the input box). cjadk's own botmux integration (`cjadk feishu`, see its
+        // botmux-wrapper-writer) sets CJADK_INTERACTIVE=0 to disable all of that.
+        // We mirror it here so a `cjadk <agent>` wrapperCli is driven the way
+        // cjadk intends — no selector, clean soft-newline input. Keyed on the
+        // wrapper's leading token so only cjadk launches are affected.
+        if (parseWrapperCli(cfg.wrapperCli)[0] === 'cjadk') {
+          (childEnv as Record<string, string>).CJADK_INTERACTIVE = '0';
+          log('cjadk launcher: set CJADK_INTERACTIVE=0 (non-interactive, mirrors cjadk feishu wrapper)');
+        }
+      }
+    }
+  }
+
   backend.spawn(spawnBin, spawnArgs, {
     cwd: spawnCwd,
     cols: PTY_COLS,
@@ -3723,6 +3844,41 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
       log(`Failed to write CLI PID marker: ${err.message}`);
     }
   }
+
+  // wrapperCli launcher (e.g. `aiden x claude`): the pid wired above is the
+  // LAUNCHER's, but it forks the real CLI (real Claude Code, Codex, …) as a
+  // child — and it's THAT child, not the launcher, that writes
+  // ~/.claude/sessions/<pid>.json and owns the transcript jsonl. With the
+  // launcher pid, resolveJsonlFromPid / findOpenClaudeSessionIds (both keyed on
+  // bridgeCliPid / backend.cliPid) find nothing, so the bridge stays pinned to a
+  // path the real CLI never writes — the model's turns never drive working/idle
+  // transitions and `botmux send`-less turns aren't forwarded. This resolver
+  // BFS-finds the real descendant pid and rewires backend.cliPid + bridgeCliPid;
+  // the bridge's 1s pid-follow poller then re-points to the CLI's real jsonl.
+  // Invoked from BOTH the synchronous pid path (tmux/pty, below) and the late
+  // pid fallback (zellij, where getChildPid() is null at spawn) so every backend
+  // is covered. No-op without an effective wrapperCli, and under sandbox (where
+  // wrapperCli is ignored, so there is no launcher indirection). session-id
+  // MARKER inference is unaffected (the launcher-pid marker is still a valid
+  // ancestor of an in-CLI `botmux send`, and the env fallback covers it too).
+  const startWrapperRealPidResolve = (launcherPid: number): void => {
+    if (!cfg.wrapperCli || !cfg.wrapperCli.trim() || sandboxOn || !claudeDataDir) return;
+    const targetCliId = cfg.cliId as CliId;
+    scheduleWrapperRealCliPid(launcherPid, {
+      findRealPid: (lp) => findLaunchedCliPid(lp, targetCliId),
+      getBackend: () => backend,
+      getChildPid: () => backend?.getChildPid?.(),
+      applyRealPid: (realPid) => {
+        log(`wrapperCli "${cfg.wrapperCli}": resolved real CLI pid ${realPid} under launcher ${launcherPid} (cliId=${targetCliId}); rewiring session discovery + bridge`);
+        (backend as TmuxBackend | PtyBackend | ZellijBackend).cliPid = realPid;
+        // Per-tick maybeFollowSessionRotationViaPid (bridge 1s poller) reads the
+        // module-level bridgeCliPid and re-points to the real CLI's jsonl.
+        bridgeCliPid = realPid;
+      },
+      schedule: (fn, ms) => { setTimeout(fn, ms); },
+    });
+  };
+  if (cliPid) startWrapperRealPidResolve(cliPid);
 
   // Wire pid + cwd so the claude-code adapter's writeInput can read
   // ~/.claude/sessions/<pid>.json — the spawn-time pid-state record. Its
@@ -3765,6 +3921,10 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
           (backend as TmuxBackend | PtyBackend | ZellijBackend).cliPid = pid;
           (backend as TmuxBackend | PtyBackend | ZellijBackend).cliCwd = cfg.workingDir;
         }
+        // wrapperCli under a late-pid backend (zellij): `pid` here is still the
+        // LAUNCHER. Kick the descendant resolver so the bridge gets the real CLI
+        // pid too (mirrors the synchronous path above). No-op for non-wrapperCli.
+        startWrapperRealPidResolve(pid);
         return;
       }
       if (++attempts < 25) setTimeout(resolveCliPidLate, 120); // ~3s budget
@@ -3796,6 +3956,11 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
       dataDir: claudeDataDir,
     });
   }
+
+  // (wrapperCli real-CLI-pid resolution is wired earlier — see
+  // startWrapperRealPidResolve, invoked from both the synchronous pid path and
+  // the zellij late-pid fallback — so the bridge above gets re-pointed to the
+  // launcher's real CLI child for every backend type.)
 
   // Structured transcript bridge fallback: if the model finishes without
   // calling `botmux send`, harvest the final answer from the CLI transcript
@@ -3863,6 +4028,10 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // the timeout). Fallback: release after READY_SIGNAL_TIMEOUT_MS → readyPattern.
   readyGate = new ReadyGate();
   if (readySignalTimer) { clearTimeout(readySignalTimer); readySignalTimer = null; }
+  if (readyFlushSettleTimer) { clearTimeout(readyFlushSettleTimer); readyFlushSettleTimer = null; }
+  isSettlingFirstFlush = false;
+  // Reset quiescence baseline so the settle measures silence from THIS spawn.
+  lastPtyOutputAtMs = Date.now();
   if (shouldArmReadyGate({
     injectsReadyHook: cliAdapter.injectsReadyHook === true,
     adoptMode: cfg.adoptMode === true,
@@ -3939,8 +4108,10 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
 function killCli(): void {
   idleDetector?.dispose();
   idleDetector = null;
-  // Cancel any pending ready-gate fallback timer; spawnCli re-arms on respawn.
+  // Cancel any pending ready-gate fallback / settle timers; spawnCli re-arms on respawn.
   if (readySignalTimer) { clearTimeout(readySignalTimer); readySignalTimer = null; }
+  if (readyFlushSettleTimer) { clearTimeout(readyFlushSettleTimer); readyFlushSettleTimer = null; }
+  isSettlingFirstFlush = false;
   stopScreenAnalyzer();
   stopScreenUpdates();
   backend?.kill();

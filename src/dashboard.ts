@@ -1,7 +1,8 @@
 // src/dashboard.ts
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createServer as createTcpServer } from 'node:net';
 import {
-  readFileSync, existsSync, chmodSync, mkdirSync, statSync,
+  readFileSync, existsSync, chmodSync, mkdirSync, statSync, createReadStream,
 } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname, extname } from 'node:path';
@@ -11,7 +12,7 @@ import { logger } from './utils/logger.js';
 import { config } from './config.js';
 import { listenWithProbe } from './utils/listen-with-probe.js';
 import {
-  generateToken, parseCookie, buildSetCookie, verifyHmac, decideDashboardAuth,
+  generateToken, parseCookie, buildSetCookie, verifyHmac, cliAuthBind, decideDashboardAuth,
   loadPersistedToken, persistToken,
 } from './dashboard/auth.js';
 import { DaemonRegistry } from './dashboard/registry.js';
@@ -24,16 +25,25 @@ import { handleConnectorApi } from './dashboard/connector-api.js';
 import { redactGroupsForPublic, redactSchedulesForPublic } from './dashboard/public-redact.js';
 import { handleWebhookRoute } from './dashboard/webhook-routes.js';
 import { handleFederationApi } from './dashboard/federation-api.js';
-import { handleFederationSpokeApi, syncAllMemberships } from './dashboard/federation-spoke-api.js';
+import { handleFederationSpokeApi, syncAllMemberships, type TeamSessionRowLike } from './dashboard/federation-spoke-api.js';
 import { getRunsDir } from './workflows/runs-dir.js';
 import { BotOnboardingManager } from './dashboard/bot-onboarding.js';
-import { CLI_OPTIONS, resolveCliId } from './setup/bot-config-editor.js';
+import {
+  CLI_SELECT_OPTIONS,
+  resolveCliSelection,
+  isTtadkWrapper,
+  ttadkAcceptsModel,
+  TTADK_DEFAULT_MODEL,
+  TTADK_MODEL_SUGGESTIONS,
+} from './setup/cli-selection.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
-import { mergeDashboardConfig, mergeMaintenanceConfig, parseMaintenancePatch, readGlobalConfig, setGlobalLocale, type DashboardGlobalConfig, type MaintenanceConfig } from './global-config.js';
+import { mergeDashboardConfig, mergeGlobalConfig, mergeMaintenanceConfig, parseMaintenancePatch, readGlobalConfig, setGlobalLocale, type DashboardGlobalConfig, type MaintenanceConfig, type RepoPickerMode } from './global-config.js';
 import { isLocale } from './i18n/types.js';
 import { isLocalDevInstall } from './utils/install-info.js';
+import { listTeamReports, readTeamBoard, setTeamBoardEntry } from './services/team-board-store.js';
 import type { CliId } from './adapters/cli/types.js';
 import type { ConnectorDefinition } from './services/connector-store.js';
+import { hd2dAssetPath, hd2dStatus, startHd2dDownload } from './dashboard/hd2d-assets.js';
 
 const SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
 const TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
@@ -67,6 +77,28 @@ let boundDashboardPort = config.dashboard.port;
 
 const SECRET = loadOrCreateSecret();
 
+function isWildcardBindHost(host: string): boolean {
+  return host === '0.0.0.0' || host === '::' || host === '';
+}
+
+function tcpPortAvailable(host: string, port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const probe = createTcpServer();
+    probe.once('error', () => resolve(false));
+    probe.listen(port, host, () => {
+      probe.close(() => resolve(true));
+    });
+  });
+}
+
+function dashboardPortAvailable(port: number): Promise<boolean> {
+  if (!isWildcardBindHost(config.dashboard.host)) return Promise.resolve(true);
+  // `botmux dashboard` talks to loopback even when the browser-facing server
+  // binds wildcard. On macOS another process can hold 127.0.0.1:port while a
+  // wildcard bind still succeeds, causing CLI HMAC calls to hit that process.
+  return tcpPortAvailable('127.0.0.1', port);
+}
+
 /** Sign a loopback request to a daemon's write-link route. The daemon verifies
  *  with the same .dashboard-secret, so only a caller that can read the secret —
  *  the dashboard — can mint write tokens; a bare local process that only knows
@@ -88,6 +120,7 @@ const attaching = new Set<string>();   // dedup concurrent attaches per appId
 interface ResolvedDashboardSettings {
   publicReadOnly: boolean;
   openTerminalInFeishu: boolean;
+  repoPickerMode: RepoPickerMode;
   /** Auto-update / auto-restart schedule (off by default). */
   maintenance: MaintenanceConfig;
   /** True when running from a source checkout — the Settings UI greys out the
@@ -96,11 +129,13 @@ interface ResolvedDashboardSettings {
 }
 
 function resolveDashboardSettings(): ResolvedDashboardSettings {
-  const dashboard = readGlobalConfig().dashboard ?? {};
+  const global = readGlobalConfig();
+  const dashboard = global.dashboard ?? {};
   return {
     publicReadOnly: dashboard.publicReadOnly ?? config.dashboard.publicReadOnly,
     openTerminalInFeishu: dashboard.openTerminalInFeishu === true,
-    maintenance: readGlobalConfig().maintenance ?? {},
+    repoPickerMode: global.repoPickerMode ?? 'all',
+    maintenance: global.maintenance ?? {},
     localDevInstall: isLocalDevInstall(),
   };
 }
@@ -193,7 +228,23 @@ const MIME: Record<string, string> = {
   '.png': 'image/png',
   '.jpg': 'image/jpeg',
   '.jpeg': 'image/jpeg',
+  '.wasm': 'application/wasm',
+  '.pck': 'application/octet-stream',
 };
+
+/** Stream an absolute file (used for HD2D cache binaries that live outside
+ *  WEB_DIR). Callers pass only vetted paths from `hd2dAssetPath`. */
+function serveFileAbs(res: ServerResponse, fp: string): boolean {
+  let st;
+  try { st = statSync(fp); } catch { return false; }
+  if (!st.isFile()) return false;
+  res.writeHead(200, {
+    'content-type': MIME[extname(fp)] ?? 'application/octet-stream',
+    'content-length': String(st.size),
+  });
+  createReadStream(fp).pipe(res);
+  return true;
+}
 
 function serveStatic(_req: IncomingMessage, res: ServerResponse, pathname: string): boolean {
   const rel = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
@@ -366,8 +417,15 @@ async function closeSessionsMatching(
 /**
  * Shared loopback-HMAC gate for the `/__cli/*` endpoints. Returns `{ ok: true }`
  * on success, or a ready-to-send `{ status, body }` error otherwise.
+ *
+ * The HMAC is bound to `method + pathname + the port WE actually bound`
+ * (`boundDashboardPort`, not the attacker-controllable Host header). That scopes
+ * a captured credential to this exact route on this exact dashboard, so a
+ * malicious local server handed a `botmux dashboard` discovery probe can't
+ * forward those headers to a different `/__cli/*` route or to the real dashboard
+ * on another port. See {@link cliAuthBind}.
  */
-function verifyCliRequest(req: IncomingMessage):
+function verifyCliRequest(req: IncomingMessage, pathname: string):
   | { ok: true }
   | { ok: false; status: number; body: Record<string, unknown> } {
   const ts = req.headers['x-botmux-cli-ts'];
@@ -377,7 +435,8 @@ function verifyCliRequest(req: IncomingMessage):
     return { ok: false, status: 400, body: { error: 'missing_headers' } };
   }
   const remote = (req.socket.remoteAddress ?? '').replace(/^::ffff:/, '');
-  const r = verifyHmac(SECRET, { ts, nonce, sig }, remote);
+  const bind = cliAuthBind(req.method ?? 'POST', pathname, boundDashboardPort);
+  const r = verifyHmac(SECRET, { ts, nonce, sig }, remote, bind);
   if (!r.ok) return { ok: false, status: 401, body: { error: 'unauthorized', reason: r.reason } };
   return { ok: true };
 }
@@ -417,7 +476,7 @@ const server = createServer(async (req, res) => {
     // CLI rotate (HMAC + loopback only) — for `botmux dashboard`. Mints a fresh
     // token, invalidating any previously-issued link.
     if (req.method === 'POST' && url.pathname === '/__cli/rotate') {
-      const gate = verifyCliRequest(req);
+      const gate = verifyCliRequest(req, url.pathname);
       if (!gate.ok) return jsonRes(res, gate.status, gate.body);
       activeToken = generateToken();
       try {
@@ -433,7 +492,7 @@ const server = createServer(async (req, res) => {
     // dashboard link survives restart untouched. 404 → no token has ever been
     // minted (caller falls back to suggesting `botmux dashboard`).
     if (req.method === 'POST' && url.pathname === '/__cli/current') {
-      const gate = verifyCliRequest(req);
+      const gate = verifyCliRequest(req, url.pathname);
       if (!gate.ok) return jsonRes(res, gate.status, gate.body);
       if (!activeToken) return jsonRes(res, 404, { error: 'no_active_token' });
       return jsonRes(res, 200, { url: dashboardUrlFor(activeToken) });
@@ -471,19 +530,60 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    // ─── Static frontend (index.html + /assets/*) ──────────────────────────
-    if (req.method === 'GET' && (url.pathname === '/' || url.pathname.startsWith('/assets/'))) {
-      // Map /assets/foo.js → WEB_DIR/foo.js
+    // ─── Static frontend (index.html + /assets/* + /game/*) ────────────────
+    if (
+      req.method === 'GET' &&
+      (url.pathname === '/' || url.pathname.startsWith('/assets/') || url.pathname.startsWith('/game/'))
+    ) {
+      // HD2D runtime binaries (index.wasm / index.pck) are NOT shipped — they
+      // are downloaded on demand into the cache dir and served from there.
+      // Everything else under /game/ is the small shell shipped in dist.
+      if (url.pathname === '/game/index.wasm' || url.pathname === '/game/index.pck') {
+        const fp = hd2dAssetPath(url.pathname.slice('/game/'.length));
+        if (fp && serveFileAbs(res, fp)) return;
+        res.writeHead(404); res.end(); return;
+      }
+      // Map /assets/foo.js → WEB_DIR/foo.js; /game/* is served as-is.
       const lookupPath = url.pathname.startsWith('/assets/')
         ? '/' + url.pathname.slice(8)
         : url.pathname;
       if (serveStatic(req, res, lookupPath)) return;
     }
 
+    // ─── HD2D office assets (token-gated: download triggers a ~74MB fetch) ──
+    if (req.method === 'GET' && url.pathname === '/api/game/status') {
+      // `proxy` prefills the office tab's optional proxy input (config value
+      // only; an env-var proxy still works as a silent fallback downstream).
+      return jsonRes(res, 200, { ...hd2dStatus(), proxy: readGlobalConfig().httpProxy ?? '' });
+    }
+    if (req.method === 'POST' && url.pathname === '/api/game/download') {
+      // Optional `proxy` in the body is persisted (so it survives restart) and
+      // takes effect immediately for this download — Node's fetch ignores the
+      // proxy env vars, so hosts behind a proxy set it here.
+      let body: unknown;
+      try { body = await readJsonBody(req); } catch { body = undefined; }
+      if (body && typeof body === 'object' && 'proxy' in body) {
+        const raw = (body as { proxy?: unknown }).proxy;
+        const proxy = typeof raw === 'string' ? raw.trim() : '';
+        mergeGlobalConfig({ httpProxy: proxy || null });
+      }
+      return jsonRes(res, 200, startHd2dDownload());
+    }
+
     // ─── Public API (cookie/token already validated above) ──────────────────
 
     if (req.method === 'GET' && url.pathname === '/api/sessions') {
-      return jsonRes(res, 200, { sessions: aggregator.getSessions() });
+      // Sessions spawned before a bot config carried a display name store the
+      // raw appId as botName — resolve through the live registry so consumers
+      // (dashboard, HD2D office tab) always see the human-facing name.
+      const names = new Map([...registry.list()].map(d => [d.larkAppId, d.botName] as const));
+      const sessions = aggregator.getSessions().map(s => {
+        const n = names.get(s.larkAppId);
+        return n && n !== s.larkAppId && (!s.botName || s.botName === s.larkAppId)
+          ? { ...s, botName: n }
+          : s;
+      });
+      return jsonRes(res, 200, { sessions });
     }
     if (req.method === 'GET' && url.pathname === '/api/schedules') {
       // Public-read carve-out: the row carries CONTENT (prompt = business
@@ -523,6 +623,12 @@ const server = createServer(async (req, res) => {
       }
       let touched = false;
       if (Object.keys(patch).length > 0) { mergeDashboardConfig(patch); touched = true; }
+      if ('repoPickerMode' in body) {
+        const v = body.repoPickerMode;
+        if (v !== 'all' && v !== 'repos') return jsonRes(res, 400, { ok: false, error: 'invalid_repoPickerMode' });
+        mergeGlobalConfig({ repoPickerMode: v });
+        touched = true;
+      }
       if ('maintenance' in body) {
         const r = parseMaintenancePatch(body.maintenance);
         if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.error });
@@ -572,10 +678,23 @@ const server = createServer(async (req, res) => {
       return handleDashboardTriggerApi(req, res, { proxyToDaemon });
     }
 
-    // CLI 下拉选项 (id + 展示名), 单一事实源在 bot-config-editor.CLI_OPTIONS,
-    // 与 setup 交互菜单顺序一致——前端打开"添加机器人"表单时拉取填充下拉.
+    // CLI 下拉选项 (id=选择键 + 展示名), 单一事实源在 cli-selection.CLI_SELECT_OPTIONS,
+    // 含 aiden×claude / aiden×codex 网关项——前端打开"添加机器人"表单时拉取填充下拉.
+    // id 既可能是普通 cliId, 也可能是 'aiden-x-claude' 这类选择键, 由 resolveCliSelection 解析.
     if (req.method === 'GET' && url.pathname === '/api/cli-options') {
-      return jsonRes(res, 200, { options: CLI_OPTIONS });
+      return jsonRes(res, 200, {
+        options: CLI_SELECT_OPTIONS.map((o) => ({
+          id: o.key,
+          label: o.label,
+          // ttadk 网关项: 前端据此把模型框默认成 glm-5.1 并挂候选下拉; CoCo 不接受 -m.
+          ...(isTtadkWrapper(o.wrapperCli)
+            ? { gateway: 'ttadk' as const, acceptsModel: ttadkAcceptsModel(o.wrapperCli) }
+            : {}),
+        })),
+        // ttadk 模型默认值 + 候选 (单一事实源在 cli-selection), 供前端模型框使用.
+        ttadkModelDefault: TTADK_DEFAULT_MODEL,
+        ttadkModelSuggestions: TTADK_MODEL_SUGGESTIONS,
+      });
     }
 
     if (req.method === 'POST' && url.pathname === '/api/bot-onboarding/start') {
@@ -588,10 +707,15 @@ const server = createServer(async (req, res) => {
       } catch {
         return jsonRes(res, 400, { ok: false, error: 'bad_json' });
       }
-      // CLI: 沿用 setup 的 resolveCliId——空 → 默认 claude-code; typo → 400.
+      // CLI: 把下拉传来的选择键 (普通 cliId 或 aiden-x-claude/codex) 解析成
+      // { cliId, wrapperCli }——空 → 默认 claude-code; 非法键 → 400.
       let cliId: CliId | undefined;
+      let wrapperCli: string | undefined;
       try {
-        cliId = resolveCliId(typeof parsed.cliId === 'string' ? parsed.cliId : undefined) ?? 'claude-code';
+        const key = typeof parsed.cliId === 'string' && parsed.cliId.trim() ? parsed.cliId.trim() : 'claude-code';
+        const sel = resolveCliSelection(key);
+        cliId = sel.cliId;
+        wrapperCli = sel.wrapperCli;
       } catch (err: any) {
         return jsonRes(res, 400, { ok: false, error: 'invalid_cli', message: err?.message ?? String(err) });
       }
@@ -605,7 +729,7 @@ const server = createServer(async (req, res) => {
         return jsonRes(res, 400, { ok: false, error: 'invalid_working_dir', message: `目录不存在或不是目录: ${bad.join(', ')}` });
       }
       const model = typeof parsed.model === 'string' && parsed.model.trim() ? parsed.model.trim() : undefined;
-      const job = botOnboarding.start({ cliId, workingDir, model });
+      const job = botOnboarding.start({ cliId, wrapperCli, workingDir, model });
       return jsonRes(res, 202, { job: botOnboarding.get(job.id) });
     }
     let mOnboard: RegExpMatchArray | null;
@@ -621,6 +745,64 @@ const server = createServer(async (req, res) => {
       const owner = aggregator.ownerOf(sid);
       if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
       const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/${op}`, { method: 'POST' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // 部署 owner 资料（左上角头像）。authed-only；代理到任一在线 daemon。
+    if (req.method === 'GET' && url.pathname === '/api/owner-profile') {
+      const d = [...registry.list()].sort((a, b) => a.botIndex - b.botIndex)[0];
+      if (!d) return jsonRes(res, 503, { ok: false, error: 'no_daemon' });
+      const upstream = await proxyToDaemon(d.larkAppId, '/api/owner-profile', { method: 'GET' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // ── 团队看板（本地托管团队，host=本部署）：共享编排 + 成员上报快照 ──────
+    // authed-only（不在公开读白名单）。远程团队走 /api/team/remote-board 代理。
+    let mBoard: RegExpMatchArray | null;
+    if (req.method === 'GET' && (mBoard = url.pathname.match(/^\/api\/team\/board\/local\/([^/]+)$/))) {
+      const teamId = decodeURIComponent(mBoard[1]);
+      return jsonRes(res, 200, {
+        ok: true,
+        board: readTeamBoard(config.session.dataDir, teamId),
+        reports: listTeamReports(config.session.dataDir, teamId),
+      });
+    }
+    if (req.method === 'POST' && (mBoard = url.pathname.match(/^\/api\/team\/board\/local\/([^/]+)\/move$/))) {
+      const teamId = decodeURIComponent(mBoard[1]);
+      const moveBody = await readJsonBody(req) as any;
+      const entry = setTeamBoardEntry(config.session.dataDir, teamId, String(moveBody?.sessionId ?? ''), moveBody?.column, moveBody?.position);
+      if (!entry) return jsonRes(res, 400, { ok: false, error: 'bad_request' });
+      return jsonRes(res, 200, { ok: true, entry });
+    }
+
+    // 看板放置 / 重命名：带 JSON body 的会话写操作，原样转发给 owner daemon。
+    // 不在公开读白名单内 → 只读访客在 decideDashboardAuth 已被 401。
+    if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/(board|rename)$/))) {
+      const sid = decodeURIComponent(m[1]); const op = m[2];
+      const owner = aggregator.ownerOf(sid);
+      if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/${op}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: Buffer.concat(chunks).toString('utf8'),
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // 会话历史（飞书消息实时拉取）。不在公开读白名单 → 只读访客 401。
+    if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/history$/))) {
+      const sid = decodeURIComponent(m[1]);
+      const owner = aggregator.ownerOf(sid);
+      if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
+      const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/history${url.search ?? ''}`, { method: 'GET' });
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(await upstream.text());
       return;
@@ -702,8 +884,12 @@ const server = createServer(async (req, res) => {
             // Strip per-bot fields from chat-level so the merged record stays
             // bot-agnostic. oncallChat lives inside memberBots; firstSeenAt is
             // accumulated as the earliest observation across all bots.
-            const { oncallChat, firstSeenAt, hasRole, ...chatBase } = c;
-            const cur = out.get(c.chatId) ?? { ...chatBase, memberBots: [] as any[], _firstSeenAt: null as number | null };
+            const { oncallChat, firstSeenAt, hasRole, observedBotNames, ...chatBase } = c;
+            const cur = out.get(c.chatId) ?? { ...chatBase, memberBots: [] as any[], _firstSeenAt: null as number | null, observedBotNames: [] as string[] };
+            // /introduce 记录按观察者（bot）分文件——跨 daemon 取并集（按名字去重）
+            if (Array.isArray(observedBotNames) && observedBotNames.length) {
+              cur.observedBotNames = [...new Set([...(cur.observedBotNames ?? []), ...observedBotNames])];
+            }
             cur.memberBots.push({
               larkAppId: d.larkAppId,
               botName: d.botName,
@@ -1228,6 +1414,7 @@ listenWithProbe({
   server,
   port: config.dashboard.port,
   host: config.dashboard.host,
+  portAvailable: dashboardPortAvailable,
   log: (m) => logger.warn(`[dashboard] ${m}`),
 }).then((port) => {
   boundDashboardPort = port;
@@ -1243,7 +1430,11 @@ listenWithProbe({
 // Federation: periodically push this deployment's bots + heartbeat to every hub
 // it has joined (best-effort; no-op when not federated). Keeps remote rosters fresh.
 const federationSync = setInterval(() => {
-  syncAllMemberships(config.session.dataDir, fetch, liveBots()).catch(() => { /* best-effort */ });
+  // sessionsProvider：顺带把本部署在各团队协作群里的会话裁剪行上报给团队 host
+  // （hub 在 sync 响应里下发协作群清单，详见 syncAllMemberships）。
+  // aggregator Row 是宽松索引类型，实际为 SessionRow（含 chatId 等字段）
+  syncAllMemberships(config.session.dataDir, fetch, liveBots(), () => aggregator.getSessions() as unknown as TeamSessionRowLike[])
+    .catch(() => { /* best-effort */ });
 }, 2 * 60 * 1000);
 federationSync.unref();
 

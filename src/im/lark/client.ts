@@ -239,6 +239,41 @@ export async function resolveUnionIdFromOpenId(
   }
 }
 
+/** 用户资料（名字+头像）查询缓存：key = appId:idType:id。负结果也缓存——
+ *  不在通讯录可见范围（41050）的用户每次查都会失败，别反复打 API。 */
+const userProfileCache = new Map<string, { name: string; avatarUrl?: string } | null>();
+const USER_PROFILE_CACHE_MAX = 1000;
+
+/**
+ * Best-effort 拉用户资料（名字 + 头像 URL）。拿不到（缺 scope / 不在可见
+ * 范围 / 网络错误）返回 null，调用方自行回退占位。
+ */
+export async function getUserProfile(
+  larkAppId: string,
+  userId: string,
+  idType: 'open_id' | 'union_id' = 'open_id',
+): Promise<{ name: string; avatarUrl?: string } | null> {
+  const key = `${larkAppId}:${idType}:${userId}`;
+  const hit = userProfileCache.get(key);
+  if (hit !== undefined) return hit;
+  let out: { name: string; avatarUrl?: string } | null = null;
+  try {
+    const c = getBotClient(larkAppId);
+    const res = await larkGet(c, `/open-apis/contact/v3/users/${encodeURIComponent(userId)}`, {
+      user_id_type: idType,
+    });
+    const u = res?.code === 0 ? res?.data?.user : null;
+    if (u?.name) {
+      out = { name: String(u.name), avatarUrl: u.avatar?.avatar_72 ?? u.avatar?.avatar_240 ?? undefined };
+    }
+  } catch (err) {
+    logger.debug(`[user-profile] lookup threw for ${userId.substring(0, 12)}: ${err instanceof Error ? err.message : err}`);
+  }
+  if (userProfileCache.size >= USER_PROFILE_CACHE_MAX) userProfileCache.clear();
+  userProfileCache.set(key, out);
+  return out;
+}
+
 /**
  * Best-effort 判断一个 open_id 是否为「真人」（通讯录里查得到 user）。
  *
@@ -1083,6 +1118,12 @@ export type ChatBotMember = {
 };
 
 export async function listChatBotMembers(larkAppId: string, chatId: string): Promise<ChatBotMember[]> {
+  // Single name-key normalizer used for EVERY cross-source name match below
+  // (cross-ref ⇄ bots-info ⇄ observed). Trim-only: strips incidental leading/
+  // trailing whitespace but stays case-sensitive, so two genuinely distinct bots
+  // whose names differ only in case ("Claude" vs "claude") never collide.
+  const norm = (s: string) => s.trim();
+
   // Read per-bot cross-reference: other bots' open_ids as seen by larkAppId's app.
   // This is populated from @mention data in Lark events (the only reliable source,
   // since Lark open_id is per-app scoped — a bot's self-reported open_id is
@@ -1093,7 +1134,7 @@ export async function listChatBotMembers(larkAppId: string, chatId: string): Pro
     if (existsSync(crossRefPath)) {
       const data: Record<string, string> = JSON.parse(readFileSync(crossRefPath, 'utf-8'));
       for (const [name, openId] of Object.entries(data)) {
-        crossRef.set(name.toLowerCase(), openId);
+        crossRef.set(norm(name), openId);
       }
     }
   } catch { /* ignore */ }
@@ -1118,7 +1159,7 @@ export async function listChatBotMembers(larkAppId: string, chatId: string): Pro
         if (res.code === 0 && res.data?.is_in_chat) {
           const info = appIdToInfo.get(appId);
           // Prefer cross-reference (correct per-app open_id), fall back to self-seen
-          const crossHit = info?.botName ? crossRef.get(info.botName.toLowerCase()) : undefined;
+          const crossHit = info?.botName ? crossRef.get(norm(info.botName)) : undefined;
           const openId = crossHit ?? info?.botOpenId ?? appId;
           const isSelf = appId === larkAppId;
           // Reliable @-mention only when the per-app open_id was learned via
@@ -1161,13 +1202,13 @@ export async function listChatBotMembers(larkAppId: string, chatId: string): Pro
     const observedList = listObservedBots(config.session.dataDir, larkAppId, chatId);
     const latestObservedByName = new Map<string, (typeof observedList)[number]>();
     for (const o of observedList) {
-      const existing = latestObservedByName.get(o.name);
+      const k = norm(o.name);
+      const existing = latestObservedByName.get(k);
       if (!existing || o.lastSeenAt > existing.lastSeenAt) {
-        latestObservedByName.set(o.name, o);
+        latestObservedByName.set(k, o);
       }
     }
     const seenOpenIds = new Set(configured.map(b => b.openId));
-    const norm = (s: string) => s.trim().toLowerCase();
     const byName = new Map<string, number[]>();
     configured.forEach((b, i) => {
       const k = norm(b.displayName);
@@ -1176,28 +1217,31 @@ export async function listChatBotMembers(larkAppId: string, chatId: string): Pro
     });
 
     for (const o of latestObservedByName.values()) {
-      if (seenOpenIds.has(o.openId)) continue;
+      const crossHit = crossRef.get(norm(o.name));
+      const openId = crossHit ?? o.openId;
+      const mentionSource: ChatBotMember['mentionSource'] = crossHit ? 'cross-ref' : 'observed';
+      if (seenOpenIds.has(openId)) continue;
       const matches = byName.get(norm(o.name)) ?? [];
       if (matches.length === 1) {
         const row = configured[matches[0]];
         // Upgrade only if not already a reliable cross-ref handle.
         if (row.mentionSource !== 'cross-ref') {
-          configured[matches[0]] = { ...row, openId: o.openId, mentionable: true, mentionSource: 'observed' };
-          seenOpenIds.add(o.openId);
+          configured[matches[0]] = { ...row, openId, mentionable: true, mentionSource };
+          seenOpenIds.add(openId);
         }
         continue; // matched → never also append as an external duplicate
       }
       configured.push({
         larkAppId: '',
-        openId: o.openId,
+        openId,
         name: o.name,
         displayName: o.name,
         source: 'introduce',
         hasTeamRole: false,
         mentionable: true,
-        mentionSource: 'observed',
+        mentionSource,
       });
-      seenOpenIds.add(o.openId);
+      seenOpenIds.add(openId);
     }
   } catch (err) {
     logger.debug(`Failed to load observed bots for ${chatId}: ${err}`);
