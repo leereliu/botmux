@@ -549,8 +549,8 @@ function readTokenUsageFromAidenCheckpoint(path: string): SessionTokenUsage | nu
 
 /** Resolve a Claude-family fork's (seed / relay) data root EXACTLY as the worker
  *  does, so usage reads hit the same transcript the CLI wrote. The adapter
- *  derives the root by realpath-resolving the binary to `<pkg>/.claude-runtime`
- *  (see deriveSeedDataDir / deriveRelayDataDir) and the worker spawns the CLI
+ *  derives the root per-fork (seed → `<pkg>/.claude-runtime`; relay → `~/.relay`,
+ *  see deriveSeedDataDir / deriveRelayDataDir) and the worker spawns the CLI
  *  with `spawnEnv = { CLAUDE_CONFIG_DIR: <that root> }`, which *overrides* any
  *  inherited env (worker.ts: process.env first, then adapter.spawnEnv). So a
  *  botmux-spawned seed/relay ALWAYS writes to the adapter-derived root —

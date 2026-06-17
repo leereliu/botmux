@@ -3,15 +3,17 @@
  *
  * Relay CLI (`@bytedance-relay/claude-code`) is the current release name of the
  * Seed fork — a Claude Code fork that reuses the entire Claude-family adapter,
- * only relocating its data root to the package's `.claude-runtime` and renaming
- * the binary. These tests lock in the variant wiring: data-root derivation,
- * CLAUDE_CONFIG_DIR injection, the `.claude.json` location, the `relay --resume`
- * handoff, and that it inherits Claude's bridge machinery (claudeDataDir / hook /
- * type-ahead) verbatim — i.e. parity with the Seed adapter under a new id/binary.
+ * only relocating its data root and renaming the binary. Relay 3.x defaults that
+ * data root to `~/.relay` (honoring `RELAY_CONFIG_DIR`), NOT the legacy
+ * `<pkg>/.claude-runtime` — botmux pins CLAUDE_CONFIG_DIR so Relay's own
+ * auto-migration never fires, hence we must point at `~/.relay` ourselves. These
+ * tests lock in that derivation, CLAUDE_CONFIG_DIR injection, the `.claude.json`
+ * location, the `relay --resume` handoff, and that it inherits Claude's bridge
+ * machinery (claudeDataDir / hook / type-ahead) verbatim.
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { join, dirname } from 'node:path';
-import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, realpathSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, realpathSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 
 // resolveCommand() shells out to probe for the binary; mock it so an absolute
@@ -25,40 +27,33 @@ vi.mock('node:child_process', () => ({
 import { createRelayAdapter, deriveRelayDataDir } from '../src/adapters/cli/relay.js';
 
 describe('deriveRelayDataDir', () => {
-  it('derives <pkg>/.claude-runtime from a binary realpath (symlink shim → dist/cli.js)', () => {
-    // Mirror the real install layout: <pkg>/dist/cli.js, reached via a shim symlink.
-    const root = realpathSync(mkdtempSync(join(tmpdir(), 'relay-pkg-')));
-    const pkg = join(root, 'node_modules', '@bytedance-relay', 'claude-code');
-    mkdirSync(join(pkg, 'dist'), { recursive: true });
-    writeFileSync(join(pkg, 'dist', 'cli.js'), '// relay');
-    const shimDir = join(root, 'shim', 'bin');
-    mkdirSync(shimDir, { recursive: true });
-    const shim = join(shimDir, 'relay');
-    symlinkSync(join(pkg, 'dist', 'cli.js'), shim);
+  afterEach(() => { delete process.env.RELAY_CONFIG_DIR; });
 
-    expect(deriveRelayDataDir(shim)).toBe(join(pkg, '.claude-runtime'));
+  it('defaults to ~/.relay (Relay 3.x default config dir, NOT the legacy .claude-runtime)', () => {
+    delete process.env.RELAY_CONFIG_DIR;
+    expect(deriveRelayDataDir()).toBe(join(homedir(), '.relay'));
   });
 
-  it('falls back to ~/.claude-runtime when the binary cannot be realpath-resolved', () => {
-    expect(deriveRelayDataDir('/nonexistent/path/to/relay')).toBe(join(homedir(), '.claude-runtime'));
+  it('honors RELAY_CONFIG_DIR override (matches a bare relay)', () => {
+    process.env.RELAY_CONFIG_DIR = '/custom/relay/cfg';
+    expect(deriveRelayDataDir()).toBe('/custom/relay/cfg');
   });
 });
 
 describe('createRelayAdapter', () => {
-  // Use a real on-disk layout so dataDir is the package's .claude-runtime.
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'relay-adapter-')));
   const pkg = join(root, 'pkg', 'claude-code');
   mkdirSync(join(pkg, 'dist'), { recursive: true });
   writeFileSync(join(pkg, 'dist', 'cli.js'), '// relay');
   const bin = join(pkg, 'dist', 'cli.js'); // absolute → resolveCommand returns as-is
-  const expectedDataDir = join(pkg, '.claude-runtime');
+  const expectedDataDir = join(homedir(), '.relay');
   const adapter = createRelayAdapter(bin);
 
   it('has id "relay"', () => {
     expect(adapter.id).toBe('relay');
   });
 
-  it('exposes claudeDataDir at the package .claude-runtime', () => {
+  it('exposes claudeDataDir at ~/.relay (Relay 3.x default)', () => {
     expect(adapter.claudeDataDir).toBe(expectedDataDir);
   });
 
@@ -78,8 +73,11 @@ describe('createRelayAdapter', () => {
     expect(adapter.hookInstall?.sessionStartCommand).toMatch(/session-ready$/);
   });
 
-  it('keeps bytedcli auth real inside the file sandbox', () => {
-    expect(adapter.authPaths).toEqual(['~/.local/share/bytedcli']);
+  it('keeps bytedcli auth AND the SuperRelay token file real inside the file sandbox', () => {
+    expect(adapter.authPaths).toEqual([
+      '~/.local/share/bytedcli',
+      join(expectedDataDir, 'byted-cloud-auth.json'),
+    ]);
   });
 
   it('prints a `relay --resume` handoff, preferring the CLI-native session id', () => {
