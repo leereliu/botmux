@@ -268,14 +268,6 @@ export function buildSessionCard(
       multi_url: terminalMultiUrl(terminalUrl),
     },
   ];
-  if (!showManageButtons) {
-    actions.push({
-      tag: 'button',
-      text: { tag: 'plain_text', content: t('card.btn.get_write_link', undefined, locale) },
-      type: 'default',
-      value: { action: 'get_write_link', ...actionBase },
-    });
-  }
   if (showManageButtons && !adoptMode) {
     actions.push({
       tag: 'button',
@@ -754,12 +746,6 @@ export function buildStreamingCard(
       value: { action: 'retry_last_task', ...actionBase },
     });
   }
-  headerActions.push({
-    tag: 'button',
-    text: { tag: 'plain_text', content: t('card.btn.get_write_link', undefined, locale) },
-    type: 'default',
-    value: { action: 'get_write_link', ...actionBase },
-  });
   if (adoptMode) {
     if (showTakeover) {
       headerActions.push({
@@ -909,12 +895,6 @@ export function buildPrivateSnapshotCard(
         text: { tag: 'plain_text', content: t('card.btn.open_terminal', undefined, locale) },
         type: 'primary',
         multi_url: terminalMultiUrl(terminalUrl),
-      },
-      {
-        tag: 'button',
-        text: { tag: 'plain_text', content: t('card.btn.get_write_link', undefined, locale) },
-        type: 'default',
-        value: { action: 'get_write_link', ...actionBase },
       },
       {
         tag: 'button',
