@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { assertSafeGitSkillPath, parseSkillInstallSource, redactGitUrlCredentials } from '../src/core/skills/sources.js';
+import { assertSafeGitRef, assertSafeGitSkillPath, parseSkillInstallSource, redactGitUrlCredentials } from '../src/core/skills/sources.js';
 
 describe('skill install sources', () => {
   it('rejects HTTPS git URLs with embedded credentials', () => {
@@ -21,6 +21,19 @@ describe('skill install sources', () => {
       kind: 'git',
       value: 'git@github.com:acme/skills.git',
     });
+  });
+
+  it('rejects command-executing git transports (ext:: RCE) regardless of git+ prefix', () => {
+    // git's ext:: transport runs an arbitrary shell command on clone.
+    expect(() => parseSkillInstallSource('git+ext::sh -c id')).toThrow(/git_url_protocol_not_allowed/);
+    expect(() => parseSkillInstallSource('ext::sh -c id.git')).toThrow(/git_url_protocol_not_allowed/);
+  });
+
+  it('allows standard git transports incl. local file/path (parity with local install)', () => {
+    expect(parseSkillInstallSource('https://example.com/acme/skills.git')).toMatchObject({ kind: 'git' });
+    expect(parseSkillInstallSource('git+ssh://example.com/acme/skills.git')).toMatchObject({ kind: 'git' });
+    expect(parseSkillInstallSource('git://example.com/acme/skills.git')).toMatchObject({ kind: 'git' });
+    expect(parseSkillInstallSource('file:///srv/repos/skills.git')).toMatchObject({ kind: 'git' });
   });
 
   it('keeps local relative paths local', () => {
@@ -69,5 +82,14 @@ describe('skill install sources', () => {
 
   it('rejects unsafe paths in GitHub browser URLs', () => {
     expect(() => parseSkillInstallSource('https://github.com/acme/skills/tree/main/skills/../deploy')).toThrow(/invalid_git_skill_path/);
+  });
+
+  it('rejects git refs that could be parsed as checkout options', () => {
+    expect(() => assertSafeGitRef('--upload-pack=touch /tmp/pwn')).toThrow(/invalid_git_ref/);
+    expect(() => assertSafeGitRef('-x')).toThrow(/invalid_git_ref/);
+    expect(() => assertSafeGitRef('main branch')).toThrow(/invalid_git_ref/);
+    expect(() => assertSafeGitRef('main')).not.toThrow();
+    expect(() => assertSafeGitRef('release/v1.2.3')).not.toThrow();
+    expect(() => assertSafeGitRef(undefined)).not.toThrow();
   });
 });

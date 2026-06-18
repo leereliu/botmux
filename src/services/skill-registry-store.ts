@@ -8,7 +8,7 @@ import { withFileLock, withFileLockSync } from '../utils/file-lock.js';
 import { loadSkillPackage } from '../core/skills/package.js';
 import { skillRegistryPath, skillSourcesDir, skillStoreDir } from '../core/skills/registry-paths.js';
 import type { SkillPackage, SkillSource } from '../core/skills/types.js';
-import { assertNoGitUrlCredentials, assertSafeGitSkillPath, githubToGitUrl, redactGitUrlCredentials } from '../core/skills/sources.js';
+import { assertAllowedGitProtocol, assertNoGitUrlCredentials, assertSafeGitRef, assertSafeGitSkillPath, githubToGitUrl, redactGitUrlCredentials } from '../core/skills/sources.js';
 
 const DEFAULT_GIT_TIMEOUT_MS = 60_000;
 const execFileAsync = promisify(execFile);
@@ -156,6 +156,18 @@ function formatGitFailure(args: string[], err: any): Error {
   return new Error(`skill_git_command_failed: ${formatGitCommand(args)}: ${reason}`);
 }
 
+// Defense-in-depth alongside assertAllowedGitProtocol: even if a dangerous
+// transport ever reached this layer, git itself refuses anything outside the
+// allowlist. GIT_TERMINAL_PROMPT=0 also keeps a private repo from hanging on an
+// interactive credential prompt instead of failing fast.
+function gitEnv(): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    GIT_ALLOW_PROTOCOL: 'https:http:ssh:git:file',
+    GIT_TERMINAL_PROMPT: '0',
+  };
+}
+
 function git(args: string[], cwd?: string): string {
   try {
     return execFileSync('git', args, {
@@ -163,6 +175,7 @@ function git(args: string[], cwd?: string): string {
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: gitTimeoutMs(),
+      env: gitEnv(),
     }).trim();
   } catch (err: any) {
     throw formatGitFailure(args, err);
@@ -175,6 +188,7 @@ async function gitAsync(args: string[], cwd?: string): Promise<string> {
       cwd,
       encoding: 'utf-8',
       timeout: gitTimeoutMs(),
+      env: gitEnv(),
     });
     return String(result.stdout ?? '').trim();
   } catch (err: any) {
@@ -184,24 +198,26 @@ async function gitAsync(args: string[], cwd?: string): Promise<string> {
 
 function ensureGitSource(url: string): string {
   assertNoGitUrlCredentials(url);
+  assertAllowedGitProtocol(url);
   const dir = join(skillSourcesDir(), sourceId(url));
   mkdirSync(skillSourcesDir(), { recursive: true });
   if (existsSync(join(dir, '.git'))) {
     git(['fetch', '--tags', '--prune'], dir);
   } else {
-    git(['clone', url, dir]);
+    git(['clone', '--', url, dir]);
   }
   return dir;
 }
 
 async function ensureGitSourceAsync(url: string): Promise<string> {
   assertNoGitUrlCredentials(url);
+  assertAllowedGitProtocol(url);
   const dir = join(skillSourcesDir(), sourceId(url));
   mkdirSync(skillSourcesDir(), { recursive: true });
   if (existsSync(join(dir, '.git'))) {
     await gitAsync(['fetch', '--tags', '--prune'], dir);
   } else {
-    await gitAsync(['clone', url, dir]);
+    await gitAsync(['clone', '--', url, dir]);
   }
   return dir;
 }
@@ -221,6 +237,7 @@ function installGitSkillLocked(opts: {
   ref?: string;
   sourceOverride?: SkillSource;
 }): SkillPackage {
+  assertSafeGitRef(opts.ref);
   const sourceDir = ensureGitSource(opts.url);
   const ref = opts.ref ?? 'HEAD';
   if (ref === 'HEAD') {
@@ -264,6 +281,7 @@ async function installGitSkillAsyncLocked(opts: {
   ref?: string;
   sourceOverride?: SkillSource;
 }): Promise<SkillPackage> {
+  assertSafeGitRef(opts.ref);
   const sourceDir = await ensureGitSourceAsync(opts.url);
   const ref = opts.ref ?? 'HEAD';
   if (ref === 'HEAD') {

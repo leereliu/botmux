@@ -32,6 +32,39 @@ export function assertNoGitUrlCredentials(raw: string): void {
   }
 }
 
+/** Refuse git transports that execute commands. git's `ext::` (and other
+ *  remote-helper) transports run an arbitrary shell command on clone, turning
+ *  "install a skill" into RCE on the daemon host. Only the standard fetch
+ *  transports are allowed; `file:`/bare local paths are permitted because they
+ *  are equivalent to the already-supported local-directory install. `git` is
+ *  also invoked with a matching `GIT_ALLOW_PROTOCOL` allowlist as
+ *  defense-in-depth. scp-like `user@host:path` carries no URL scheme and is SSH. */
+const ALLOWED_GIT_PROTOCOLS = new Set(['https:', 'http:', 'ssh:', 'git:', 'file:']);
+
+function isScpLikeGitUrl(raw: string): boolean {
+  return !raw.includes('://') && /^[A-Za-z0-9._-]+@[^/]+:/.test(raw);
+}
+
+export function assertAllowedGitProtocol(raw: string): void {
+  if (isScpLikeGitUrl(raw)) return; // scp short form → SSH
+  const url = parseMaybeUrl(raw);
+  // No parseable scheme → git treats it as a local path (same trust as a local
+  // directory install). A parseable scheme must be on the allowlist; `ext:` and
+  // friends fall through to the throw.
+  if (!url) return;
+  if (!ALLOWED_GIT_PROTOCOLS.has(url.protocol)) {
+    throw new Error('git_url_protocol_not_allowed');
+  }
+}
+
+/** Refuse refs that could be mistaken for a `git checkout` option (leading `-`)
+ *  or carry control characters. Real branch/tag/commit refs never start with a
+ *  dash, so this is safe to reject outright. */
+export function assertSafeGitRef(ref: string | undefined): void {
+  if (ref === undefined) return;
+  if (!ref || ref.startsWith('-') || /[\0\s]/.test(ref)) throw new Error('invalid_git_ref');
+}
+
 export function assertSafeGitSkillPath(path: string): void {
   if (!path || path.includes('\0')) throw new Error('invalid_git_skill_path');
   if (isAbsolute(path) || /^[A-Za-z]:[\\/]/.test(path)) throw new Error('invalid_git_skill_path');
@@ -104,7 +137,9 @@ export function parseSkillInstallSource(raw: string): ParsedSkillInstallSource {
   const githubSource = parseGitHubBrowserUrl(raw);
   if (githubSource) return githubSource;
   if (raw.startsWith('git+') || raw.endsWith('.git') || raw.startsWith('git@')) {
-    return { kind: 'git', value: raw.replace(/^git\+/, '') };
+    const value = raw.replace(/^git\+/, '');
+    assertAllowedGitProtocol(value);
+    return { kind: 'git', value };
   }
   return { kind: 'local', value: raw };
 }
