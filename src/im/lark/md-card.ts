@@ -276,6 +276,15 @@ function imageRowElement(imgKeys: string[]): any {
 const IMG_TOKEN_SRC = /!\[[^\]]*\]\(([^)\s]+)\)/g;
 /** A whole line that is nothing but 2+ image tokens (the "image row" form). */
 const IMG_ROW_LINE = /^\s*(?:!\[[^\]]*\]\([^)\s]+\)\s*){2,}$/;
+/**
+ * Feishu-uploaded image keys look like `img_v2_…` / `img_v3_…`. Only a line
+ * whose every src is such a key is promoted to a native `img` row — a model
+ * reply may emit a `![](https://…) ![](…)` URL line, and a native `img`
+ * element with a URL as its "img_key" makes Feishu reject the whole card.
+ * Non-img_key lines fall through to the markdown widget unchanged (same as
+ * before this feature existed).
+ */
+const FEISHU_IMG_KEY = /^img_v\d/i;
 
 type BodySegment = { type: 'text'; content: string } | { type: 'imgrow'; keys: string[] };
 
@@ -299,12 +308,14 @@ function splitImageRowSegments(input: string): BodySegment[] {
       continue;
     }
     if (!fenceChar && IMG_ROW_LINE.test(line)) {
-      flush();
       const keys = Array.from(line.matchAll(IMG_TOKEN_SRC), m => m[1]);
-      segs.push({ type: 'imgrow', keys });
-    } else {
-      buf.push(line);
+      if (keys.every(k => FEISHU_IMG_KEY.test(k))) {
+        flush();
+        segs.push({ type: 'imgrow', keys });
+        continue;
+      }
     }
+    buf.push(line);
   }
   flush();
   return segs;
