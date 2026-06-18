@@ -903,6 +903,8 @@ describe('codex writeInput submission confirmation', () => {
       'resume',
       '--dangerously-bypass-approvals-and-sandbox',
       '--no-alt-screen',
+      '-c',
+      'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
       '019dd3e2-f2da-7592-86b5-a43d4cd0772f',
     ]);
   });
@@ -920,6 +922,8 @@ describe('codex writeInput submission confirmation', () => {
       'resume',
       '--dangerously-bypass-approvals-and-sandbox',
       '--no-alt-screen',
+      '-c',
+      'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
       '019dd3e2-f2da-7592-86b5-a43d4cd0772f',
     ]);
   });
@@ -935,6 +939,8 @@ describe('codex writeInput submission confirmation', () => {
       'resume',
       '--dangerously-bypass-approvals-and-sandbox',
       '--no-alt-screen',
+      '-c',
+      'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
       'new-codex-session',
     ]);
   });
@@ -951,6 +957,8 @@ describe('codex writeInput submission confirmation', () => {
         'resume',
         '--dangerously-bypass-approvals-and-sandbox',
         '--no-alt-screen',
+        '-c',
+        'shell_environment_policy.set.BOTMUX_SESSION_ID="custom-botmux-session"',
         'custom-codex-session',
       ]);
 
@@ -972,6 +980,8 @@ describe('codex writeInput submission confirmation', () => {
     expect(adapter.buildArgs({ sessionId: 'botmux-session', resume: true })).toEqual([
       '--dangerously-bypass-approvals-and-sandbox',
       '--no-alt-screen',
+      '-c',
+      'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
     ]);
   });
 
@@ -986,6 +996,8 @@ describe('codex writeInput submission confirmation', () => {
     })).toEqual([
       '--dangerously-bypass-approvals-and-sandbox',
       '--no-alt-screen',
+      '-c',
+      'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
       '-C',
       '/repo/root',
     ]);
