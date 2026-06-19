@@ -37,6 +37,12 @@ import { createPiAdapter } from '../src/adapters/cli/pi.js';
 import { createCopilotAdapter } from '../src/adapters/cli/copilot.js';
 import { createOhMyPiAdapter } from '../src/adapters/cli/oh-my-pi.js';
 import { createAceAdapter } from '../src/adapters/cli/ace.js';
+import {
+  acePasteSettleDelayMs,
+  isAceLargePaste,
+  ACE_LARGE_PASTE_CHAR_THRESHOLD,
+  ACE_LARGE_PASTE_LINE_THRESHOLD,
+} from '../src/adapters/cli/ace.js';
 import type { CliAdapter, CliId } from '../src/adapters/cli/types.js';
 
 // ---------------------------------------------------------------------------
@@ -607,6 +613,23 @@ describe('ace buildArgs', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-ace', resume: true });
     expect(args).not.toContain('sess-ace');
     expect(args).not.toContain('--resume');
+  });
+});
+
+describe('ace large paste submit timing', () => {
+  it('detects large paste by line and char thresholds', () => {
+    expect(isAceLargePaste('a\nb\nc\nd\ne')).toBe(false);
+    expect(isAceLargePaste('a\nb\nc\nd\ne\nf')).toBe(true);
+    expect(isAceLargePaste('x'.repeat(ACE_LARGE_PASTE_CHAR_THRESHOLD))).toBe(false);
+    expect(isAceLargePaste('x'.repeat(ACE_LARGE_PASTE_CHAR_THRESHOLD + 1))).toBe(true);
+  });
+
+  it('uses longer settle delay for large pastes', () => {
+    const small = acePasteSettleDelayMs('hello', false);
+    const large = acePasteSettleDelayMs(`${'<line>\n'.repeat(ACE_LARGE_PASTE_LINE_THRESHOLD + 10)}`, false);
+    expect(small).toBe(500);
+    expect(large).toBeGreaterThan(small);
+    expect(large).toBeLessThanOrEqual(2500);
   });
 });
 

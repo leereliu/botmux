@@ -68,6 +68,29 @@ function submitPrefix(content: string): string {
   return content.slice(0, 40);
 }
 
+/** Match Ace TUI InputPrompt large-paste collapse (text-buffer.ts). */
+export const ACE_LARGE_PASTE_LINE_THRESHOLD = 5;
+export const ACE_LARGE_PASTE_CHAR_THRESHOLD = 500;
+
+/** Ace collapses pastes above these limits to `[Pasted Text: N lines]`. */
+export function isAceLargePaste(content: string): boolean {
+  const lineCount = content.split('\n').length;
+  return lineCount > ACE_LARGE_PASTE_LINE_THRESHOLD
+    || content.length > ACE_LARGE_PASTE_CHAR_THRESHOLD;
+}
+
+/** Delay after paste before the first Enter — longer when Ace will show a paste placeholder. */
+export function acePasteSettleDelayMs(content: string, hasImagePath: boolean): number {
+  const base = hasImagePath ? 800 : 500;
+  if (!isAceLargePaste(content)) return base;
+  const lineCount = content.split('\n').length;
+  const extraLines = Math.max(0, lineCount - ACE_LARGE_PASTE_LINE_THRESHOLD);
+  return Math.min(2500, base + 400 + extraLines * 35);
+}
+
+/** Extra beat between first and second Enter on large pastes. */
+const ACE_LARGE_PASTE_SECOND_ENTER_DELAY_MS = 500;
+
 export function createAceAdapter(pathOverride?: string): CliAdapter {
   const rawBin = pathOverride ?? 'ace';
   let cachedBin: string | undefined;
@@ -109,7 +132,8 @@ export function createAceAdapter(pathOverride?: string): CliAdapter {
       const beforeCount = readUserMessages(logsPath).length;
       const prefix = submitPrefix(content);
       const hasImagePath = /\.(jpe?g|png|gif|webp|svg|bmp)\b/i.test(content);
-      const submitDelay = hasImagePath ? 800 : 500;
+      const largePaste = isAceLargePaste(content);
+      const submitDelay = acePasteSettleDelayMs(content, hasImagePath);
 
       const trySendEnter = (): boolean => {
         try {
@@ -135,6 +159,17 @@ export function createAceAdapter(pathOverride?: string): CliAdapter {
 
       await delay(submitDelay);
       if (!trySendEnter()) return { submitted: false };
+
+      // Large botmux-wrapped prompts collapse to `[Pasted Text: N lines]` in Ace.
+      // tmux paste + a single quick Enter often strands the message in the input
+      // box; a second Enter after extra settle time commits reliably.
+      if (largePaste) {
+        await delay(ACE_LARGE_PASTE_SECOND_ENTER_DELAY_MS);
+        if (!logsContainNewUserMessage(logsPath, beforeCount, prefix)) {
+          if (!trySendEnter()) return { submitted: false };
+          await delay(200);
+        }
+      }
 
       if (!existsSync(logsPath) && beforeCount === 0) {
         if (await waitForLogsAppend(logsPath, beforeCount, prefix, 1200)) {
