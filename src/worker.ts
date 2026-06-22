@@ -5028,7 +5028,17 @@ process.on('message', async (raw: unknown) => {
       // process would never actually restart. destroySession() tears the session
       // down so the respawn starts a fresh CLI. (PTY has no destroySession, so
       // the ?. no-ops and killCli()'s kill() does the teardown.)
+      // onExit nulls backend before the daemon's restart message arrives, so
+      // destroySession() is often a no-op — kill the tmux session by name so
+      // spawnCli doesn't reattach to a dead pane and crash on pipe-pane.
       backend?.destroySession?.();
+      if (lastInitConfig?.backendType === 'tmux') {
+        const stale = TmuxBackend.sessionName(lastInitConfig.sessionId);
+        if (TmuxBackend.hasSession(stale)) {
+          TmuxBackend.killSession(stale);
+          log(`Restart: killed stale tmux session ${stale}`);
+        }
+      }
       killCli();
       awaitingFirstPrompt = true;
       setTimeout(() => {

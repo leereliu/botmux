@@ -211,7 +211,7 @@ export class TmuxPipeBackend implements SessionBackend {
     try {
       execSync(
         `tmux pipe-pane -O -t ${shellescape(this.paneTarget)} 'cat > ${shellescape(this.fifoPath)}'`,
-        { stdio: 'ignore', timeout: 5000, env: tmuxEnv() },
+        { stdio: 'ignore', timeout: 15000, env: tmuxEnv() },
       );
       this.pipeAttached = true;
       this.startLifecycleWatcher();

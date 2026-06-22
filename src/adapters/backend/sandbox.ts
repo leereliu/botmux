@@ -388,7 +388,7 @@ export function prepareSandbox(opts: {
   let emptyIdx = 0;
   for (const p of opts.hidePaths ?? []) {
     if (!p || typeof p !== 'string') continue;
-    const resolved = resolveSandboxPath(p);
+    const resolved = resolveSandboxPath(p.replace(/^~(?=\/|$)/, home));
     let isDir = false;
     try { isDir = existsSync(resolved) && statSync(resolved).isDirectory(); } catch { /* */ }
     if (isDir) {

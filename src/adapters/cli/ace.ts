@@ -102,7 +102,14 @@ export function createAceAdapter(pathOverride?: string): CliAdapter {
 
   return {
     id: 'ace',
-    authPaths: ['~/.ace/oauth_creds.json'],
+    // Keep bytedcli SSO + moderation-cli cookie cache on the REAL host (not the
+    // home overlay) so `bytedcli auth login --session` and moderation-cli
+    // helpers can reuse the devbox browser/Feishu session inside the sandbox.
+    authPaths: [
+      '~/.ace/oauth_creds.json',
+      '~/.local/share/bytedcli',
+      '~/.cache/moderation-cli',
+    ],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
     buildArgs({ workingDir, initialPrompt, model, disableCliBypass }) {
