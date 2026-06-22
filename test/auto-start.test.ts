@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import {
   chatHasAllowedUser,
+  chatNameMatchesAutoStartRegex,
   resolveGroupJoinPrompt,
   shouldAutoStartOnNewTopic,
   waitForAllowedUserInChat,
@@ -75,6 +76,35 @@ describe('resolveGroupJoinPrompt (场景① D8)', () => {
 
   it('returns empty string for a blank prompt', () => {
     expect(resolveGroupJoinPrompt('   ')).toBe('');
+  });
+});
+
+describe('chatNameMatchesAutoStartRegex (场景① 群名 gate)', () => {
+  const tcsRegex = '(TCS/OPUS TX / #|TCS / #|TCS_EU)';
+
+  it('matches TCS transfer group names', () => {
+    expect(
+      chatNameMatchesAutoStartRegex(
+        '[Transfer] S2 / TCS / #40644053 / malabonga.9 / Domain: UPL I...',
+        tcsRegex,
+      ),
+    ).toBe(true);
+    expect(
+      chatNameMatchesAutoStartRegex(
+        '[Transfer] TCS_EU / #7787 / mootez.sahbani / The video is not...',
+        tcsRegex,
+      ),
+    ).toBe(true);
+  });
+
+  it('does not match unrelated group names', () => {
+    expect(chatNameMatchesAutoStartRegex('Botmux-Ace-B2B-Test', tcsRegex)).toBe(false);
+  });
+
+  it('returns false for empty name, blank regex, or invalid regex', () => {
+    expect(chatNameMatchesAutoStartRegex(null, tcsRegex)).toBe(false);
+    expect(chatNameMatchesAutoStartRegex('TCS / #', '')).toBe(false);
+    expect(chatNameMatchesAutoStartRegex('foo', '(unclosed')).toBe(false);
   });
 });
 

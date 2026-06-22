@@ -84,6 +84,24 @@ export function resolveGroupJoinPrompt(configured: string | undefined): string {
 }
 
 /**
+ * 场景① optional gate: does the chat display name match the configured regex?
+ * Returns false when the name is blank, the pattern is blank, or the regex is invalid.
+ */
+export function chatNameMatchesAutoStartRegex(
+  chatName: string | null | undefined,
+  pattern: string | undefined,
+): boolean {
+  const name = (chatName ?? '').trim();
+  const raw = (pattern ?? '').trim();
+  if (!name || !raw) return false;
+  try {
+    return new RegExp(raw).test(name);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * 场景①: D7 gate with retry — wait for an allowedUser to appear in the chat.
  *
  * Alarm/oncall platforms that auto-create incident chats (e.g. ByteDance

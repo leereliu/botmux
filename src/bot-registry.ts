@@ -252,6 +252,12 @@ export interface BotConfig {
    */
   autoStartOnGroupJoinPrompt?: string;
   /**
+   * 主动开工 — 场景① optional chat-name gate. When set, only chats whose
+   * display name matches this regex auto-start on join (D7 allowedUser
+   * membership is skipped). When unset, only the D7 allowedUser gate applies.
+   */
+  autoStartOnGroupJoinChatNameRegex?: string;
+  /**
    * 主动开工 — 场景②. When true, in a 话题群 (topic mode) every new topic's first
    * message auto-starts a session even without an @mention (the default role +
    * the user's first message form the prompt). No effect in regular groups.
@@ -813,6 +819,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // so an empty string doesn't linger in bots.json.
       autoStartOnGroupJoinPrompt: typeof entry.autoStartOnGroupJoinPrompt === 'string' && entry.autoStartOnGroupJoinPrompt.trim()
         ? entry.autoStartOnGroupJoinPrompt
+        : undefined,
+      autoStartOnGroupJoinChatNameRegex: typeof entry.autoStartOnGroupJoinChatNameRegex === 'string' && entry.autoStartOnGroupJoinChatNameRegex.trim()
+        ? entry.autoStartOnGroupJoinChatNameRegex.trim()
         : undefined,
       autoStartOnNewTopic: entry.autoStartOnNewTopic === true || undefined,
       // Per-bot regular-group default mode. Only 'new-topic' | 'shared' are

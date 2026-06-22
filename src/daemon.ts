@@ -14,8 +14,8 @@ import { botmuxWrapperFiles } from './core/botmux-wrapper.js';
 import { startMaintenance, stopMaintenance } from './core/maintenance.js';
 import { sendRestartReportIfPending } from './core/restart-report.js';
 import { statSync } from 'node:fs';
-import { getChatMode, listChatMemberOpenIds, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage } from './im/lark/client.js';
-import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
+import { getChatMode, getChatName, listChatMemberOpenIds, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage } from './im/lark/client.js';
+import { chatNameMatchesAutoStartRegex, resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import { loadBotConfigs, registerBot, getBot, getAllBots, findOncallChatForAnyBot, type BotState, type OncallChat } from './bot-registry.js';
 import * as sessionStore from './services/session-store.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
@@ -2532,8 +2532,9 @@ async function warnGroupJoinScopeOnce(larkAppId: string, detail: string): Promis
 
 /**
  * 主动开工 — 场景①: the bot was added to a chat. Auto-start a session when
- * (1) the bot opted in via `autoStartOnGroupJoin`, and (2) at least one of its
- * allowedUsers is a member of the chat (D7). Working dir per D6: the bot's
+ * (1) the bot opted in via `autoStartOnGroupJoin`, and (2) either the chat
+ * display name matches `autoStartOnGroupJoinChatNameRegex` (name gate), or
+ * at least one allowedUser is a member (D7). Working dir per D6: the bot's
  * default working dir, else degrade to the repo-selection card. The first-turn
  * prompt is the configured prompt, or empty (the role/identity envelope still
  * makes it a non-empty CLI turn — the bot reads the group context itself, D8).
@@ -2566,28 +2567,44 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
   if (priorAnchorKey) groupJoinAnchorByChat.delete(chatLiveKey); // stale entry, will re-register below
   autoStartJoinInFlight.add(lockKey);
   try {
-    // D7 gate: an allowedUser must be a member of the chat. Alarm/oncall
-    // platforms (e.g. Nexus) create the chat, add bots first and the human
-    // members moments later — a one-shot membership snapshot here races
-    // against that and loses, so re-check with backoff before giving up
-    // (the in-flight lock above keeps duplicate bot.added events deduped
-    // while we wait).
-    let hasAllowedUser: boolean;
-    try {
-      hasAllowedUser = await waitForAllowedUserInChat({
-        listMembers: () => listChatMemberOpenIds(larkAppId, chatId),
-        allowedUsers: bot.resolvedAllowedUsers,
-        onRetry: (attempt, delayMs) =>
-          logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 暂无 allowedUser 成员，${delayMs}ms 后重查（第 ${attempt} 次）`),
-      });
-    } catch (err: any) {
-      logger.warn(`[auto-start:入群] ${chatId.substring(0, 12)} 拉群成员失败：${err?.message ?? err}`);
-      await warnGroupJoinScopeOnce(larkAppId, String(err?.message ?? err));
-      return;
-    }
-    if (!hasAllowedUser) {
-      logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 群内无 allowedUser 成员，忽略`);
-      return;
+    const nameRegex = botCfg.autoStartOnGroupJoinChatNameRegex;
+    if (nameRegex) {
+      const chatName = await getChatName(larkAppId, chatId);
+      if (!chatNameMatchesAutoStartRegex(chatName, nameRegex)) {
+        logger.info(
+          `[auto-start:入群] ${chatId.substring(0, 12)} 群名未命中 regex，忽略`
+          + (chatName ? `（${chatName.substring(0, 60)}）` : '（群名不可用）'),
+        );
+        return;
+      }
+      logger.info(
+        `[auto-start:入群] ${chatId.substring(0, 12)} 群名命中 regex，开工`
+        + (chatName ? `（${chatName.substring(0, 60)}）` : ''),
+      );
+    } else {
+      // D7 gate: an allowedUser must be a member of the chat. Alarm/oncall
+      // platforms (e.g. Nexus) create the chat, add bots first and the human
+      // members moments later — a one-shot membership snapshot here races
+      // against that and loses, so re-check with backoff before giving up
+      // (the in-flight lock above keeps duplicate bot.added events deduped
+      // while we wait).
+      let hasAllowedUser: boolean;
+      try {
+        hasAllowedUser = await waitForAllowedUserInChat({
+          listMembers: () => listChatMemberOpenIds(larkAppId, chatId),
+          allowedUsers: bot.resolvedAllowedUsers,
+          onRetry: (attempt, delayMs) =>
+            logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 暂无 allowedUser 成员，${delayMs}ms 后重查（第 ${attempt} 次）`),
+        });
+      } catch (err: any) {
+        logger.warn(`[auto-start:入群] ${chatId.substring(0, 12)} 拉群成员失败：${err?.message ?? err}`);
+        await warnGroupJoinScopeOnce(larkAppId, String(err?.message ?? err));
+        return;
+      }
+      if (!hasAllowedUser) {
+        logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 群内无 allowedUser 成员，忽略`);
+        return;
+      }
     }
 
     const chatType: 'group' = 'group';

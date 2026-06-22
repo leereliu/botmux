@@ -83,8 +83,9 @@
 
 | 字段 | 说明 |
 |------|------|
-| `autoStartOnGroupJoin` | `true` 时，被拉入含至少一名 `allowedUsers` 的新群即自动开工（不必 @）。需在飞书后台为该应用订阅 `im.chat.member.bot.added_v1` 事件 |
+| `autoStartOnGroupJoin` | `true` 时，被拉入新群即尝试自动开工（不必 @）。需在飞书后台为该应用订阅 `im.chat.member.bot.added_v1` 事件 |
 | `autoStartOnGroupJoinPrompt` | 配合上面：自动开工的首轮 prompt；留空 / 空白则空消息开场，让 bot 自己读群上下文。`autoStartOnGroupJoin` 关闭时无意义 |
+| `autoStartOnGroupJoinChatNameRegex` | 可选。设置后**仅**群显示名匹配该正则的群会入群自动开工（跳过 `allowedUsers` 成员门禁）。未配置时仍走 `allowedUsers` 成员门禁 |
 | `autoStartOnNewTopic` | `true` 时，话题群里每个新话题的首条消息无需 @ 也自动开工（普通群无效）。默认被动（仅 @ 触发） |
 
 ## 语音

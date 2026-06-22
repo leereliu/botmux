@@ -83,8 +83,9 @@ There are many fields, listed below grouped by purpose. The vast majority are **
 
 | Field | Description |
 |------|------|
-| `autoStartOnGroupJoin` | When `true`, the bot starts working automatically when added to a new group containing at least one `allowedUsers` member (no @ needed). Requires subscribing the `im.chat.member.bot.added_v1` event for this app in the Lark admin console |
+| `autoStartOnGroupJoin` | When `true`, the bot attempts to auto-start when added to a new group (no @ needed). Requires subscribing the `im.chat.member.bot.added_v1` event for this app in the Lark admin console |
 | `autoStartOnGroupJoinPrompt` | Paired with the above: the first-round prompt for proactive start; if empty / blank, opens with an empty message and lets the bot read the group context itself. Meaningless when `autoStartOnGroupJoin` is off |
+| `autoStartOnGroupJoinChatNameRegex` | Optional. When set, only groups whose display name matches this regex auto-start on join (skips the `allowedUsers` membership gate). When unset, the `allowedUsers` membership gate still applies |
 | `autoStartOnNewTopic` | When `true`, the first message of every new topic in a topic group starts working automatically without an @ (no effect in plain groups). Defaults to passive (only @ triggers) |
 
 ## Voice
